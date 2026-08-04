@@ -36,6 +36,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
 /// The actual location of a file outside the virtual filesystem, e.g. a host
@@ -1212,6 +1213,53 @@ impl Fs {
         path: P,
         options: GuestOpenOptions,
     ) -> Result<GuestFile, ()> {
+        let path = path.as_ref();
+        let was_a_create = options.create;
+        let res = self.open_with_options_inner(path, options);
+        // A failed open of a file the app expected to read is worth reporting:
+        // engines that can't find their assets typically carry on with null
+        // objects and simply render nothing, so this miss is the only warning
+        // we get, and it used to be `log_dbg!`-only, i.e. invisible in release
+        // builds — which is every build users actually run.
+        if res.is_err() && !was_a_create {
+            self.log_failed_open(path);
+        }
+        res
+    }
+
+    /// Report a failed open, throttled. Apps probe for optional files (save
+    /// games, per-language assets, config overrides) as a matter of course, so
+    /// logging every miss forever would drown out everything else.
+    fn log_failed_open(&self, path: &GuestPath) {
+        // Deduplicate by path rather than counting occurrences: an app that
+        // probes the same missing file every frame would otherwise use up the
+        // budget and hide the *other* paths it failed to find, which are the
+        // interesting ones. The distinct-path count is what needs bounding.
+        const LIMIT: usize = 1024;
+        static SEEN: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+        let Ok(mut seen) = SEEN.lock() else { return };
+        let seen = seen.get_or_insert_with(std::collections::HashSet::new);
+        if seen.len() >= LIMIT {
+            return;
+        }
+        if !seen.insert(path.as_str().to_owned()) {
+            return;
+        }
+        log!(
+            "Warning: the app tried to open {:?}, which does not exist",
+            path.as_str()
+        );
+        if seen.len() == LIMIT {
+            log!("Warning: further \"file does not exist\" warnings are silenced");
+        }
+    }
+
+    fn open_with_options_inner(
+        &mut self,
+        path: &GuestPath,
+        options: GuestOpenOptions,
+    ) -> Result<GuestFile, ()> {
         let GuestOpenOptions {
             read,
             mut write, // ИСПРАВЛЕНИЕ: Разрешаем менять переменную
@@ -1227,8 +1275,6 @@ impl Fs {
             log!("Warning: App tried to create/truncate file without write permissions. Forcing write = true.");
             write = true;
         }
-
-        let path = path.as_ref();
 
         let (parent_node, new_filename) = self.lookup_parent_node(path).ok_or(())?;
         let FsNode::Directory {

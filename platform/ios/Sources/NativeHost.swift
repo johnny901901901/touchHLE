@@ -1381,6 +1381,9 @@ private struct SettingsView: View {
     @AppStorage("networkAccess") private var networkAccess = false
     @AppStorage("analogTilt") private var analogTilt = true
     @AppStorage("autoEnableJIT") private var autoEnableJIT = true
+    @AppStorage("limitIPACache") private var limitIPACache = true
+    @AppStorage("ipaCacheBudgetMiB") private var ipaCacheBudgetMiB =
+        EmulatorCore.defaultIPACacheBudgetMiB
     @AppStorage("defaultCore") private var defaultCoreRaw = ""
 
     private var defaultCore: CoreKind {
@@ -1446,6 +1449,25 @@ private struct SettingsView: View {
                 }
 
                 JITDiagnosticsSection()
+
+                Section {
+                    Toggle("Limit IPA Memory Cache", isOn: $limitIPACache)
+
+                    if limitIPACache {
+                        Picker("Cache Limit", selection: $ipaCacheBudgetMiB) {
+                            Text("32 MB").tag(32)
+                            Text("64 MB").tag(64)
+                            Text("128 MB").tag(128)
+                            Text("256 MB").tag(256)
+                        }
+                    }
+                } header: {
+                    Text("Memory")
+                } footer: {
+                    Text(limitIPACache
+                        ? "Game files read from the .ipa are kept in memory. Limiting this stops large games from being killed by iOS for using too much memory. Raise the limit if a game stutters while loading."
+                        : "Unlimited: every file read from the .ipa stays in memory for the whole session. Faster for games that re-read one large resource file, but a large game can be killed by iOS for using too much memory.")
+                }
 
                 Section("Advanced") {
                     NavigationLink {

@@ -14,7 +14,8 @@ use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::cg_affine_transform::{
     CGAffineTransform, CGAffineTransformIdentity,
 };
-use crate::frameworks::core_graphics::{CGPoint, CGRect};
+use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+use crate::frameworks::foundation::NSUInteger;
 use crate::frameworks::foundation::ns_string;
 use crate::frameworks::uikit::ui_application::{
     UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight,
@@ -320,6 +321,61 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())addSubview:(id)view {
     log_dbg!("[(UIWindow*){:?} addSubview:{:?}] => ()", this, view);
+
+    // A direct child of the window with *both* dimensions flexible is asking to
+    // fill the window - that is what UIViewAutoresizingFlexibleWidth |
+    // FlexibleHeight means when the parent is the screen. Real UIKit applies
+    // that during the layout pass which follows the window being sized to the
+    // screen; touchHLE forces the window to `UIScreen.bounds` back in
+    // `-initWithCoder:`, before any subviews exist, so that pass never had a
+    // size change to propagate and the subview kept the size the nib gave it.
+    //
+    // The Sims Medieval for iPad lays its `EAGLView` out on Interface Builder's
+    // 320x460 iPhone canvas with mask 0x12 (flexible width and height) and
+    // never touches its frame in code, so the guest's render surface stayed
+    // 320x460 inside a 768x1024 window: the game drew into a corner of the
+    // screen and the rest of it stayed blank.
+    //
+    // Deliberately conservative - it only ever grows a view, and only when the
+    // view asked to be flexible on both axes, so anything laid out smaller than
+    // the window on purpose is left alone.
+    if view != nil {
+        const FLEXIBLE_WIDTH: NSUInteger = 1 << 1;
+        const FLEXIBLE_HEIGHT: NSUInteger = 1 << 4;
+        let mask: NSUInteger = msg![env; view autoresizingMask];
+        let autoresizes: bool = msg![env; this autoresizesSubviews];
+        // A view carrying a transform has already had its geometry decided by
+        // whoever rotated it - The Sims Medieval for iPad sets its EAGLView to
+        // `(128, -128) 768x1024`, which is a landscape frame seen through a
+        // quarter-turn rotation. Stretching that to the window's bounds throws
+        // the rotation compensation away.
+        let transform: CGAffineTransform = msg![env; view transform];
+        if autoresizes
+            && transform.is_identity()
+            && (mask & FLEXIBLE_WIDTH) != 0
+            && (mask & FLEXIBLE_HEIGHT) != 0
+        {
+            let bounds: CGRect = msg![env; this bounds];
+            let frame: CGRect = msg![env; view frame];
+            let width = (bounds.size.width - frame.origin.x).max(frame.size.width);
+            let height = (bounds.size.height - frame.origin.y).max(frame.size.height);
+            if width != frame.size.width || height != frame.size.height {
+                log!(
+                    "[(UIWindow*){:?} addSubview:{:?}] autoresizingMask={:#04x} asks to fill \
+                     the window: stretching {:?} to {:?}",
+                    this,
+                    view,
+                    mask,
+                    frame.size,
+                    CGSize { width, height },
+                );
+                () = msg![env; view setFrame:(CGRect {
+                    origin: frame.origin,
+                    size: CGSize { width, height },
+                })];
+            }
+        }
+    }
 
     if view == nil || env.objc.borrow::<UIViewHostObject>(view).view_controller == nil {
         () = msg_super![env; this addSubview:view];

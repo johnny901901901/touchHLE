@@ -189,7 +189,7 @@ fn perror(env: &mut Environment, s: ConstPtr<u8>) {
         errno_msg.to_string()
     };
 
-    let _ = std::io::stderr().write_all(msg.as_bytes());
+    let _ = crate::guest_console::stderr().write_all(msg.as_bytes());
 }
 
 fn strerror(env: &mut Environment, err_num: i32) -> ConstPtr<u8> {

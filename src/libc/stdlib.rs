@@ -126,6 +126,22 @@ fn malloc(env: &mut Environment, mut size: GuestUSize) -> MutVoidPtr {
 
     let ptr = env.mem.alloc(size);
     if ptr.is_null() {
+        // Say this out loud. A failed guest allocation is not a survivable
+        // condition for most of these apps: `operator new` reacts by calling
+        // one of the `std::__throw_*` helpers, which dyld.rs patches to return
+        // rather than throw (touchHLE cannot unwind guest C++ exceptions), so
+        // the caller gets a null buffer back from something that cannot fail
+        // by contract and carries on with a corrupted object. That surfaces
+        // far away from here - Dracula: The Last Sanctuary ends up with a
+        // TeArray whose element count is 58 and whose storage pointer is null,
+        // and `TeLayout::draw()` then calls a virtual method on 58 null
+        // children every frame and draws nothing.
+        log!(
+            "Warning: malloc({:#x}) failed — the guest heap is exhausted. \
+             Expect the app to misbehave: C++ `operator new` cannot report \
+             this failure by throwing here, so callers will use a null buffer.",
+            size
+        );
         set_errno(env, crate::libc::errno::ENOMEM);
     }
     ptr.cast()

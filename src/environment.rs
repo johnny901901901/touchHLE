@@ -1222,6 +1222,19 @@ impl Environment {
         &mut self.threads[self.current_thread].thread_local_framework_state
     }
 
+    /// Record that the guest has made observable forward progress, clearing the
+    /// repeated-`UndefinedInstruction` bypass counter in `debug_cpu_error`.
+    ///
+    /// That counter exists to stop an app that is stuck re-trapping on the same
+    /// bad address from hanging the emulator forever. Presenting a frame is
+    /// proof that the app is *not* stuck, so a game that draws while tolerating
+    /// a bogus call every frame should be allowed to keep running instead of
+    /// being aborted once the count happens to reach the limit.
+    pub fn note_forward_progress(&mut self) {
+        self.udf_bypass_last = None;
+        self.udf_bypass_count = 0;
+    }
+
     /// Put the current thread to sleep for some duration, running other threads
     /// in the meantime as appropriate. Functions that call sleep right before
     /// they return back to the main run loop ([Environment::run]) should set
@@ -1897,6 +1910,16 @@ impl Environment {
                 }
 
                 // Track repeated occurrences of the same bypass site.
+                //
+                // The counter is cleared whenever the guest presents a frame
+                // (see `note_forward_progress`), so the limit is really "this
+                // many identical bogus calls within a single frame". An app
+                // that keeps drawing is not hung, whatever it is re-trapping
+                // on: Dracula: The Last Sanctuary calls one bad function
+                // pointer a couple of times per frame, survives the faked
+                // return, and used to be killed at 61 FPS by a guard whose
+                // whole purpose is to catch apps that have stopped making
+                // progress.
                 const BYPASS_LIMIT: u32 = 256;
                 const LOG_RATE: u32 = 32;
                 let key = (pc, lr);

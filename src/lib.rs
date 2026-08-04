@@ -38,6 +38,7 @@ mod frameworks;
 mod fs;
 mod gdb;
 mod gles;
+mod guest_console;
 mod image;
 mod libc;
 mod licenses;

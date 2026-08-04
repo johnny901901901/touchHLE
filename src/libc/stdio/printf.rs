@@ -914,7 +914,7 @@ fn vprintf(env: &mut Environment, format: ConstPtr<u8>, arg: VaList) -> i32 {
     );
     let res = printf_inner::<false, _>(env, |mem, idx| mem.read(format + idx), arg);
     // TODO: I/O error handling
-    let _ = std::io::stdout().write_all(&res);
+    let _ = crate::guest_console::stdout().write_all(&res);
     res.len().try_into().unwrap()
 }
 
@@ -1202,7 +1202,7 @@ fn wprintf(env: &mut Environment, format: ConstPtr<wchar_t>, args: DotDotDot) ->
         args.start(),
     );
 
-    let _ = std::io::stdout().write_all(&res);
+    let _ = crate::guest_console::stdout().write_all(&res);
     res.len().try_into().unwrap()
 }
 
@@ -1216,7 +1216,7 @@ fn printf(env: &mut Environment, format: ConstPtr<u8>, args: DotDotDot) -> i32 {
     );
     let res = printf_inner::<false, _>(env, |mem, idx| mem.read(format + idx), args.start());
     // TODO: I/O error handling
-    let _ = std::io::stdout().write_all(&res);
+    let _ = crate::guest_console::stdout().write_all(&res);
     res.len().try_into().unwrap()
 }
 
@@ -2048,8 +2048,8 @@ fn vfprintf(env: &mut Environment, stream: MutPtr<FILE>, format: ConstPtr<u8>, a
                 res.len()
             );
         }
-        STDOUT_FILENO => _ = std::io::stdout().write_all(&res),
-        STDERR_FILENO => _ = std::io::stderr().write_all(&res),
+        STDOUT_FILENO => _ = crate::guest_console::stdout().write_all(&res),
+        STDERR_FILENO => _ = crate::guest_console::stderr().write_all(&res),
         _ => {
             let buf = env.mem.alloc_and_write_cstr(res.as_slice());
             let result = fwrite(
@@ -2097,7 +2097,7 @@ fn vwprintf(env: &mut Environment, format: ConstPtr<wchar_t>, arg: VaList) -> i3
         arg,
     );
     // Пишем результат напрямую в стандартный вывод (stdout)
-    let _ = std::io::stdout().write_all(&res);
+    let _ = crate::guest_console::stdout().write_all(&res);
     res.len().try_into().unwrap()
 }
 
@@ -2124,11 +2124,11 @@ fn NSLogv(env: &mut Environment, format: id, arg: VaList) -> i32 {
         );
 
         let msg_str = String::from_utf8_lossy(&res);
+        // Already routed to the log above; writing it to the guest's stderr
+        // as well would duplicate every line now that stream goes to the log.
         log!("NSLog: {}", msg_str);
-        let _ = std::io::stderr().write_all(format!("NSLog: {}\n", msg_str).as_bytes());
     } else {
         log!("NSLog: (null format)");
-        let _ = std::io::stderr().write_all(b"NSLog: (null format)\n");
     }
     0
 }

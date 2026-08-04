@@ -51,6 +51,18 @@ pub struct Options {
     /// rebuild: the host reads it from `touchHLE_options.txt` in the app's
     /// Documents directory.
     pub present_rotation_override: Option<u32>,
+    /// Report `UIScreen.bounds` (and so `applicationFrame`) rotated to match
+    /// the current device orientation, rather than always portrait.
+    ///
+    /// iPhone OS through iOS 7 always reported portrait bounds and rotated the
+    /// app's *views* instead, which is why portrait is the default here. That
+    /// only works if something rotates the views: an app whose EAGLView is a
+    /// direct child of the window (no view controller) never gets that
+    /// treatment, so it builds a portrait drawable and renders its landscape
+    /// scene into it, and the presented frame comes out stretched. Reporting
+    /// rotated bounds gives those apps a landscape window, view and drawable,
+    /// which is what The Sims Medieval for iPad needs.
+    pub landscape_uiscreen_bounds: bool,
     /// On iOS, present an OpenGL ES 2.0 renderbuffer directly even when its
     /// CAEAGLayer is not the fullscreen layer, instead of going through the
     /// Core Animation composition path.
@@ -140,6 +152,7 @@ impl Default for Options {
             host_screen_size: None,
             initial_orientation: DeviceOrientation::Portrait,
             present_rotation_override: None,
+            landscape_uiscreen_bounds: false,
             ios_es2_direct_present: false,
             scale_hack: NonZeroU32::new(1).unwrap(),
             analog_stick_tilt_controls: true,
@@ -197,6 +210,10 @@ impl Options {
             self.initial_orientation = DeviceOrientation::LandscapeRight;
         } else if arg == "--upside-down" {
             self.initial_orientation = DeviceOrientation::PortraitUpsideDown;
+        } else if arg == "--landscape-uiscreen-bounds" {
+            self.landscape_uiscreen_bounds = true;
+        } else if arg == "--no-landscape-uiscreen-bounds" {
+            self.landscape_uiscreen_bounds = false;
         } else if arg == "--ios-es2-direct-present" {
             self.ios_es2_direct_present = true;
         } else if arg == "--no-ios-es2-direct-present" {

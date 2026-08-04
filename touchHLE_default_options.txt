@@ -341,3 +341,27 @@ com.disney.SwampyGame: --device-family=iphone-3gs
 # black screen. The direct presenter costs a readback every frame, so it stays
 # opt-in and is enabled per app here.
 com.ea.simsmedieval.bv: --ios-es2-direct-present
+
+# The Sims Medieval for iPad: draws its frame already in the display's
+# orientation, like the iPhone SKU above. Its EAGLView is added straight to the
+# window rather than through a view controller, so touchHLE never applies the
+# auto-rotation transform that `needs_autorotation_compensation` in
+# `present_renderbuffer` exists to mirror - compensating anyway put the game a
+# quarter turn out. Present the guest's frame as-is.
+#
+# It also needs a landscape screen from the very first frame. The game asks to
+# rotate to LandscapeRight at startup, but `UIScreen.bounds` is portrait on
+# iPhone OS through iOS 7 (UIKit rotated the app's views instead) - and this
+# app's EAGLView hangs off the window with no view controller, so nothing ever
+# rotates it. It therefore built a 768x1024 drawable and rendered its landscape
+# scene into it, while the presented viewport followed the rotation: a 3:4 frame
+# stretched across a 4:3 screen. `--landscape-right` fixes the orientation
+# before the nib loads and `--landscape-uiscreen-bounds` makes UIScreen report
+# 1024x768, so the window, the (flexible) EAGLView and the drawable all come out
+# landscape and the frame is presented 1:1.
+com.ea.simsmedieval.ipad.bv: --landscape-right --landscape-uiscreen-bounds --present-rotation=0
+# Dracula: The Last Sanctuary HD is a universal (iPhone+iPad) build. It picks
+# its own "platform" tag and loads the 1024x768 HD art set, so it has to be run
+# as an iPad or the engine lays that art out on a 320x480 screen and draws
+# nothing. Landscape-only per its Info.plist.
+com.microids.dracula2univ: --device-family=ipad

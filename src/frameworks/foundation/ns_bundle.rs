@@ -1060,12 +1060,22 @@ fn path_for_resource_helper(
     let data_path: id = msg![env; path stringByAppendingPathComponent:data_component];
     let data_path: id = msg![env; data_path stringByAppendingPathComponent:name];
     let data_path_exists: bool = msg![env; file_manager fileExistsAtPath:data_path];
-    log!(
-        "NSBundle resource lookup: {:?} missing, Unity Data fallback {:?} exists={}",
-        path,
-        data_path,
-        data_path_exists
-    );
+    // Log the paths themselves, not the NSString pointers: a run where an app
+    // cannot find its assets produces hundreds of these lines, and object
+    // addresses say nothing about *which* file is missing.
+    {
+        let path_str = ns_string::to_rust_string(env, path).into_owned();
+        if data_path_exists {
+            let data_path_str = ns_string::to_rust_string(env, data_path).into_owned();
+            log!(
+                "NSBundle resource lookup: {:?} missing, found in Unity Data fallback {:?}",
+                path_str,
+                data_path_str,
+            );
+        } else {
+            log!("NSBundle resource lookup: {:?} missing", path_str);
+        }
+    }
     if data_path_exists {
         return data_path;
     }

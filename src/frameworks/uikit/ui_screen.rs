@@ -17,7 +17,9 @@ pub struct State {
 fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u32) {
     let (portrait_width, portrait_height) = env.window().device_family().portrait_size();
 
-    if std::env::var_os("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS").is_some() {
+    if env.options.landscape_uiscreen_bounds
+        || std::env::var_os("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS").is_some()
+    {
         let is_landscape = !matches!(
             env.window().current_rotation(),
             crate::window::DeviceOrientation::Portrait

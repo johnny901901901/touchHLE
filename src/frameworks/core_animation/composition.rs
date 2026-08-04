@@ -837,6 +837,26 @@ unsafe fn composite_layer_recursive(
         have_background
     };
 
+    // Diagnostic: an EAGL layer's geometry decides where the game's frame lands
+    // in the composited output. Log it once - bounds, where it is anchored, and
+    // whether it carries a transform - since a rotation that isn't reaching this
+    // point shows up as the frame occupying part of the screen pre-rotated.
+    if host_obj.presented_pixels.is_some() {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            log!(
+                "Compositing EAGL layer {:?}: bounds={:?} position={:?} anchor={:?} \
+                 affine_transform={:?} (identity={})",
+                layer,
+                host_obj.bounds,
+                host_obj.position,
+                host_obj.anchor_point,
+                host_obj.affine_transform,
+                host_obj.affine_transform.is_identity(),
+            );
+        });
+    }
+
     let need_texture = host_obj.presented_pixels.is_some()
         || host_obj.contents != nil
         || host_obj.cg_context.is_some();

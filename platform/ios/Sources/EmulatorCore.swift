@@ -146,9 +146,35 @@ final class EmulatorCore {
     static func withRunning<T>(_ core: EmulatorCore, _ body: () -> T) -> T {
         running = core
         setenv("TOUCHHLE_DEFAULT_OPTIONS_FILE", core.kind.defaultOptionsFileName, 1)
+        setenv("TOUCHHLE_IPA_CACHE_BUDGET_MIB", ipaCacheBudgetMiB(), 1)
         defer { running = nil }
         return body()
     }
+
+    /// The decompressed-IPA cache limit to hand the core, in MiB, or "0" for
+    /// unlimited.
+    ///
+    /// Content read out of a game's .ipa is decompressed into memory and kept
+    /// there. Without a limit that grows with everything the game has ever
+    /// opened, which is enough for an asset-heavy game to exceed iOS's
+    /// per-process memory limit and be killed by jetsam. Turning the limit off
+    /// restores the old cache-everything behaviour, which is faster for games
+    /// that re-read one big resource bundle but unsafe for large ones.
+    ///
+    /// Passed through the environment rather than as a `runGame` argument so the
+    /// C ABI stays identical for both cores; a core that does not know the
+    /// variable simply ignores it.
+    private static func ipaCacheBudgetMiB() -> String {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "limitIPACache") == nil {
+            return String(defaultIPACacheBudgetMiB)
+        }
+        guard defaults.bool(forKey: "limitIPACache") else { return "0" }
+        let configured = defaults.integer(forKey: "ipaCacheBudgetMiB")
+        return String(configured > 0 ? configured : defaultIPACacheBudgetMiB)
+    }
+
+    static let defaultIPACacheBudgetMiB = 64
 
     private init(kind: CoreKind) throws {
         guard let libraryURL = kind.libraryURL else {

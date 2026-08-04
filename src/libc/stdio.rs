@@ -459,7 +459,7 @@ fn fwrite(
     match fd {
         STDOUT_FILENO => {
             let buffer_slice = env.mem.bytes_at(buffer.cast(), total_size);
-            match std::io::stdout().write(buffer_slice) {
+            match crate::guest_console::stdout().write(buffer_slice) {
                 Ok(bytes_written) => (bytes_written / (item_size as usize)) as GuestUSize,
                 Err(_err) => {
                     env.libc_state
@@ -472,7 +472,7 @@ fn fwrite(
         }
         STDERR_FILENO => {
             let buffer_slice = env.mem.bytes_at(buffer.cast(), total_size);
-            match std::io::stderr().write(buffer_slice) {
+            match crate::guest_console::stderr().write(buffer_slice) {
                 Ok(bytes_written) => (bytes_written / (item_size as usize)) as GuestUSize,
                 Err(_err) => {
                     env.libc_state
@@ -693,8 +693,8 @@ fn puts(env: &mut Environment, s: ConstPtr<u8>) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let _ = std::io::stdout().write_all(env.mem.cstr_at(s));
-    let _ = std::io::stdout().write_all(b"\n");
+    let _ = crate::guest_console::stdout().write_all(env.mem.cstr_at(s));
+    let _ = crate::guest_console::stdout().write_all(b"\n");
     // TODO: I/O error handling
     // TODO: is this the return value iPhone OS uses?
     0
@@ -704,7 +704,7 @@ fn putchar(env: &mut Environment, c: u8) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let _ = std::io::stdout().write(std::slice::from_ref(&c));
+    let _ = crate::guest_console::stdout().write(std::slice::from_ref(&c));
     0
 }
 

@@ -801,11 +801,14 @@ pub const CLASSES: ClassExports = objc_classes! {
         let final_frame: CGRect = msg![env; this frame];
         let user_int: bool = msg![env; this isUserInteractionEnabled];
         let hidden: bool = msg![env; this isHidden];
+        let final_mask: NSUInteger = msg![env; this autoresizingMask];
         log!(
-            "UIView initWithCoder finished: {} {:?} frame={:?} userInteraction={} hidden={} subviews={}",
+            "UIView initWithCoder finished: {} {:?} frame={:?} autoresizingMask={:#04x} \
+             userInteraction={} hidden={} subviews={}",
             class_name,
             this,
             final_frame,
+            final_mask,
             user_int,
             hidden,
             subview_count,
@@ -1653,6 +1656,36 @@ pub const CLASSES: ClassExports = objc_classes! {
                         height: 320.0,
                     },
                 };
+            }
+        }
+    }
+
+    // Diagnostic: an EAGL-backed view *is* the guest's render surface, so
+    // whether the app resizes it decides how much of the screen the game
+    // covers. Log the first few changes - and their absence is just as
+    // informative.
+    {
+        let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+        let is_eagl = if layer == nil {
+            false
+        } else {
+            let eagl_layer_class: Class = msg_class![env; CAEAGLLayer class];
+            msg![env; layer isKindOfClass:eagl_layer_class]
+        };
+        if is_eagl {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static LOGGED: AtomicUsize = AtomicUsize::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+                let old_frame: CGRect = msg![env; this frame];
+                let view_class: Class = msg![env; this class];
+                let view_class_name = env.objc.get_class_name(view_class).to_owned();
+                log!(
+                    "EAGL-backed view {} {:?} setFrame: {:?} -> {:?}",
+                    view_class_name,
+                    this,
+                    old_frame,
+                    frame,
+                );
             }
         }
     }

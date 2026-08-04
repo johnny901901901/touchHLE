@@ -54,6 +54,21 @@ impl State {
     }
 }
 
+/// Whether to log another line of enumeration detail. Enumeration is chatty
+/// enough to swamp the log in a long session, but the first few hundred lines
+/// cover app start-up, which is where resource discovery happens.
+fn note_enumeration() -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const LIMIT: usize = 600;
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    let count = COUNT.fetch_add(1, Ordering::Relaxed);
+    if count == LIMIT {
+        log!("Further directory-enumeration logging is silenced");
+    }
+    count < LIMIT
+}
+
 pub(super) fn opendir(env: &mut Environment, filename: ConstPtr<u8>) -> MutPtr<DIR> {
     // TODO: handle errno properly
     set_errno(env, 0);
@@ -78,7 +93,22 @@ pub(super) fn opendir(env: &mut Environment, filename: ConstPtr<u8>) -> MutPtr<D
             set_errno(env, ENOENT);
             return Ptr::null();
         };
-        let vec = iter.map(|(str, type_)| (str.to_string(), type_)).collect();
+        let vec: Vec<(String, FsNodeType)> =
+            iter.map(|(str, type_)| (str.to_string(), type_)).collect();
+        // Directory enumeration decides which resources an app can find at all
+        // (engines commonly discover per-device/per-language asset directories
+        // by listing the parent), so make the listing we hand over visible.
+        // Throttled, because some apps enumerate directories every frame.
+        if note_enumeration() {
+            let names: Vec<&str> = vec.iter().map(|(name, _)| name.as_str()).collect();
+            log!(
+                "opendir({:?}) => {:?}, {} entries: {:?}",
+                path_string,
+                dir,
+                names.len(),
+                names
+            );
+        }
         State::get_mut(env).open_dirs.insert(dir, vec);
         State::get_mut(env).read_dirs.insert(dir, Vec::new());
         dir
@@ -105,7 +135,17 @@ pub(super) fn readdir(env: &mut Environment, dirp: MutPtr<DIR>) -> MutPtr<dirent
         dir.idx,
         vec.get(dir.idx)
     );
-    if let Some((str, type_)) = vec.get(dir.idx) {
+    let entry = vec.get(dir.idx);
+    if note_enumeration() {
+        log!(
+            "readdir({:?}) [{}/{}] => {:?}",
+            dirp,
+            dir.idx,
+            vec.len(),
+            entry.map(|(name, _)| name.as_str())
+        );
+    }
+    if let Some((str, type_)) = entry {
         dir.idx += 1;
         env.mem.write(dirp, dir);
 

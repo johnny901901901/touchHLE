@@ -146,7 +146,7 @@ impl BundleData {
             BundleData::HostDirectory(path) => FsNode::from_host_dir(&path, false),
             BundleData::Zip { zip, bundle_path } => {
                 let archive = Rc::new(RefCell::new(zip));
-                let archive_cache = Rc::new(RefCell::new(HashMap::new()));
+                let archive_cache = Rc::new(RefCell::new(ArchiveFilesCache::new()));
                 let metadata_map = Rc::new(RefCell::new(HashMap::new()));
 
                 let mut archive_guard = (*archive).borrow_mut();
@@ -212,11 +212,131 @@ struct ArchivedFileMetadata {
 /// file open won't waste memory.
 type DecompressedFile = Rc<[u8]>;
 
+/// Default limit on how much decompressed IPA content to keep cached, in MiB.
+///
+/// Entries used to be cached forever with no bound. That is fine for the small
+/// bundles this cache was written for, but a Unity-era game keeps hundreds of
+/// megabytes of assets in its IPA, and reading them all once was enough to push
+/// the host process past iOS's per-process memory limit and get it killed by
+/// jetsam (Colin McRae Rally reached ~1.85 GiB resident and died silently just
+/// after its first frame).
+///
+/// Eviction only drops the *cache's* reference: an [IpaFile] that is still open
+/// holds its own [Rc] and keeps reading happily from its buffer.
+const DEFAULT_ARCHIVE_CACHE_BUDGET_MIB: usize = 64;
+
+/// Environment variable overriding [DEFAULT_ARCHIVE_CACHE_BUDGET_MIB]. `0`
+/// means unbounded, i.e. the original cache-forever behaviour.
+///
+/// This is read from the environment rather than plumbed through [crate::Options]
+/// because the cache is built while the bundle is being opened, before an
+/// `Environment` exists — and because the iOS host has to be able to set it
+/// without changing the C ABI it shares with the other emulator core.
+const ARCHIVE_CACHE_BUDGET_ENV: &str = "TOUCHHLE_IPA_CACHE_BUDGET_MIB";
+
+fn archive_cache_budget() -> Option<usize> {
+    let mib = match std::env::var(ARCHIVE_CACHE_BUDGET_ENV) {
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(mib) => mib,
+            Err(_) => {
+                log!(
+                    "Warning: ignoring {}={:?}: expected a number of MiB (0 for unlimited).",
+                    ARCHIVE_CACHE_BUDGET_ENV,
+                    value
+                );
+                DEFAULT_ARCHIVE_CACHE_BUDGET_MIB
+            }
+        },
+        Err(_) => DEFAULT_ARCHIVE_CACHE_BUDGET_MIB,
+    };
+    if mib == 0 {
+        log!(
+            "Decompressed-IPA cache is unlimited ({}=0). Large bundles may exhaust memory.",
+            ARCHIVE_CACHE_BUDGET_ENV
+        );
+        None
+    } else {
+        log!("Decompressed-IPA cache limit: {} MiB.", mib);
+        Some(mib * 1024 * 1024)
+    }
+}
+
+/// The decompressed-content cache for one IPA, with a byte budget.
+#[derive(Debug)]
+struct ArchiveFilesCache {
+    /// Maximum total size of cached content, or [None] for unlimited.
+    budget: Option<usize>,
+    /// Cached content by zip entry index, with the tick at which it was last
+    /// used.
+    files: HashMap<usize, (DecompressedFile, u64)>,
+    /// Total size of everything in `files`.
+    bytes: usize,
+    /// Monotonic counter standing in for a clock; only the order matters.
+    tick: u64,
+}
+
+impl ArchiveFilesCache {
+    fn new() -> Self {
+        ArchiveFilesCache {
+            budget: archive_cache_budget(),
+            files: HashMap::new(),
+            bytes: 0,
+            tick: 0,
+        }
+    }
+
+    fn get(&mut self, index: usize) -> Option<DecompressedFile> {
+        self.tick += 1;
+        let tick = self.tick;
+        let (file, last_used) = self.files.get_mut(&index)?;
+        *last_used = tick;
+        Some(Rc::clone(file))
+    }
+
+    fn insert(&mut self, index: usize, file: DecompressedFile) {
+        self.tick += 1;
+        self.bytes += file.len();
+        if let Some((evicted, _)) = self.files.insert(index, (file, self.tick)) {
+            self.bytes -= evicted.len();
+        }
+        self.evict_to_budget(index);
+    }
+
+    /// Drop least-recently-used entries until we are within budget, never
+    /// evicting `keep` (the entry the caller is about to hand out — evicting it
+    /// would be pointless work, and a single entry larger than the whole budget
+    /// must still be cacheable).
+    fn evict_to_budget(&mut self, keep: usize) {
+        let Some(budget) = self.budget else { return };
+        while self.bytes > budget {
+            let victim = self
+                .files
+                .iter()
+                .filter(|&(&index, _)| index != keep)
+                .min_by_key(|&(_, &(_, last_used))| last_used)
+                .map(|(&index, _)| index);
+            let Some(victim) = victim else {
+                // Only `keep` is left; nothing more we can give back.
+                return;
+            };
+            if let Some((evicted, _)) = self.files.remove(&victim) {
+                self.bytes -= evicted.len();
+                log_dbg!(
+                    "Evicted IPA entry {} ({} bytes) from the decompressed-file cache; {} bytes cached",
+                    victim,
+                    evicted.len(),
+                    self.bytes
+                );
+            }
+        }
+    }
+}
+
 /// Represents a file inside an IPA bundle that can be opened.
 #[derive(Debug)]
 pub struct IpaFileRef {
     archive: Rc<RefCell<ZipArchive<std::fs::File>>>,
-    archive_files_cache: Rc<RefCell<HashMap<usize, DecompressedFile>>>,
+    archive_files_cache: Rc<RefCell<ArchiveFilesCache>>,
     metadata_map: Rc<RefCell<HashMap<usize, ArchivedFileMetadata>>>,
     index: usize,
 }
@@ -230,7 +350,12 @@ impl IpaFileRef {
         // The solution here is to cache unzipped data in memory, which should
         // be OK as early iOS IPA files are relatively small in size.
         let mut archive_cache = (*self.archive_files_cache).borrow_mut();
-        archive_cache.entry(self.index).or_insert_with(|| {
+        if let Some(cached_file) = archive_cache.get(self.index) {
+            return IpaFile {
+                file: Cursor::new(cached_file),
+            };
+        }
+        let decompressed = {
             // Read the zip entry into an owned buffer inside its own block so
             // the `archive` RefMut is released before we touch the caches.
             let mut archive = (*self.archive).borrow_mut();
@@ -300,10 +425,10 @@ impl IpaFileRef {
                     Rc::from(Vec::new())
                 }
             }
-        });
-        let cached_file = Rc::clone(archive_cache.get(&self.index).unwrap());
+        };
+        archive_cache.insert(self.index, Rc::clone(&decompressed));
         IpaFile {
-            file: Cursor::new(cached_file),
+            file: Cursor::new(decompressed),
         }
     }
 

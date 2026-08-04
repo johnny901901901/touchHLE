@@ -20,7 +20,9 @@ use crate::gles::{
     create_gles1_ctx, create_gles2_ctx, create_gles3_ctx, gles1_on_gl2, GLESContext, GLES,
 };
 use crate::mem::MutPtr;
-use crate::objc::{id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject};
+use crate::objc::{
+    id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports, HostObject,
+};
 use crate::options::Options;
 use crate::Environment;
 use std::cell::RefCell;
@@ -273,7 +275,27 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (bool)renderbufferStorage:(NSUInteger)target
                fromDrawable:(id)drawable { // EAGLDrawable (always CAEAGLayer*)
-    log!("[EAGLContext renderbufferStorage:{:#x} fromDrawable:{:?}]", target, drawable);
+    // The drawable decides how big the guest's render surface is, which decides
+    // how much of the screen the game covers, so record what we were handed:
+    // its class, its bounds and the screen it is being sized against.
+    if drawable != nil {
+        let drawable_class: Class = msg![env; drawable class];
+        let drawable_class_name = env.objc.get_class_name(drawable_class).to_owned();
+        let drawable_bounds: CGRect = msg![env; drawable bounds];
+        let screen: id = msg_class![env; UIScreen mainScreen];
+        let screen_bounds: CGRect = msg![env; screen bounds];
+        log!(
+            "[EAGLContext renderbufferStorage:{:#x} fromDrawable:{:?}] \
+             drawable is {} bounds={:?}, UIScreen.bounds={:?}",
+            target,
+            drawable,
+            drawable_class_name,
+            drawable_bounds,
+            screen_bounds,
+        );
+    } else {
+        log!("[EAGLContext renderbufferStorage:{:#x} fromDrawable:nil]", target);
+    }
 
     assert!(target == gles11::RENDERBUFFER_OES);
 
@@ -580,6 +602,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     // plain log!() would flood, but the very first call is a key signal that
     // the app actually got past splash/init and is rendering.
     log_once!("[EAGLContext presentRenderbuffer:] first call (app reached first frame)");
+
+    // Presenting a frame is the clearest evidence the guest is still making
+    // progress, so it clears the repeated-UndefinedInstruction bypass counter.
+    // See `Environment::note_forward_progress`.
+    env.note_forward_progress();
 
     // Frame-count milestones. presentRenderbuffer is called every frame, so we
     // want a small, fixed number of log lines that prove the render loop is
