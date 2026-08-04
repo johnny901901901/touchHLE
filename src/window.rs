@@ -1862,17 +1862,29 @@ impl Window {
             // on a fullscreen window, so it must be temporarily stop being
             // fulscreen.
             // Apparently, doing this does result in resizing the window.
-            self.window
-                .set_fullscreen(sdl2::video::FullscreenType::Off)
-                .unwrap();
+            //
+            // None of this is allowed to be fatal. On iOS the host UI decides
+            // whether the interface may rotate, and if it has not rotated yet
+            // SDL2 rejects the new display mode with "Screen orientation does
+            // not match display mode size". That used to panic and take the
+            // whole game down mid-play; a failed rotation is far better than
+            // that, and the next rotation attempt can still succeed.
+            if let Err(err) = self.window.set_fullscreen(sdl2::video::FullscreenType::Off) {
+                log!("Warning: couldn't leave fullscreen to rotate: {}", err);
+            }
             unsafe {
                 let window_raw = self.window.raw();
                 sdl2_sys::SDL_SetWindowResizable(window_raw, sdl2_sys::SDL_bool::SDL_FALSE);
                 sdl2_sys::SDL_SetWindowResizable(window_raw, sdl2_sys::SDL_bool::SDL_TRUE);
             }
-            self.window
-                .set_fullscreen(sdl2::video::FullscreenType::True)
-                .unwrap();
+            if let Err(err) = self.window.set_fullscreen(sdl2::video::FullscreenType::True) {
+                log!(
+                    "Warning: couldn't return to fullscreen after rotating to {:?}: {}. \
+                     The host UI may not permit this orientation.",
+                    new_orientation,
+                    err
+                );
+            }
         }
 
         self.device_orientation = new_orientation;

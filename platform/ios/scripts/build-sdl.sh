@@ -30,6 +30,6 @@ xcodebuild \
     -destination "$DESTINATION" \
     -derivedDataPath "$REPO/build/sdl-$SDK" \
     CODE_SIGNING_ALLOWED=NO \
-    IPHONEOS_DEPLOYMENT_TARGET=17.4 \
+    IPHONEOS_DEPLOYMENT_TARGET=15.0 \
     EXCLUDED_SOURCE_FILE_NAMES=SDL_shaders_metal.metal \
     build

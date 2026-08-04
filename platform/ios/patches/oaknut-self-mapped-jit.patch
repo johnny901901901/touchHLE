@@ -1,0 +1,86 @@
+diff --git a/externals/oaknut/include/oaknut/code_block.hpp b/externals/oaknut/include/oaknut/code_block.hpp
+index 559f7caa..b2b0ed67 100644
+--- a/externals/oaknut/include/oaknut/code_block.hpp
++++ b/externals/oaknut/include/oaknut/code_block.hpp
+@@ -57,6 +57,61 @@ __attribute__((noinline, optnone, naked)) static void detach_jit_server()
+         "ret\n");
+ }
+ 
++extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr, std::size_t usersize);
++
++// Whether the process carries CS_DEBUGGED.
++//
++// prepare_jit_region() above obtains executable memory by trapping into a
++// debugger that implements a handler for `brk #0xf00d`. Only StikDebug does
++// that, and it has to stay attached. A process marked CS_DEBUGGED can instead
++// map executable memory itself, which is what TrollStore's JIT provides.
++inline bool process_is_debuggable()
++{
++    static const bool result = [] {
++        unsigned int flags = 0;
++        // CS_OPS_STATUS == 0, CS_DEBUGGED == 1 << 28.
++        if (csops(getpid(), 0, &flags, sizeof(flags)) != 0)
++            return false;
++        return (flags & 0x10000000u) != 0;
++    }();
++    return result;
++}
++
++// Same shape as the trap path below: an executable mapping plus a writable
++// alias of it, made with vm_remap. Deliberately NOT a single PROT_READ |
++// PROT_WRITE | PROT_EXEC mapping - per mmap(2), iOS silently hands back a
++// writable-but-NOT-executable region for that request, and jumping into it
++// kills the process with no diagnostic.
++inline bool map_jit_region(std::size_t size, std::uint32_t** out_x, std::uint32_t** out_w)
++{
++    void* x = mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
++    if (x == MAP_FAILED)
++        return false;
++
++    vm_address_t w = 0;
++    vm_prot_t cur_prot, max_prot;
++    kern_return_t result = vm_remap(mach_task_self(),
++                                    &w,
++                                    size,
++                                    0,
++                                    VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR,
++                                    mach_task_self(),
++                                    reinterpret_cast<mach_vm_address_t>(x),
++                                    false,
++                                    &cur_prot,
++                                    &max_prot,
++                                    VM_INHERIT_NONE);
++    if (result != KERN_SUCCESS
++        || vm_protect(mach_task_self(), w, size, false, VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
++        munmap(x, size);
++        return false;
++    }
++
++    *out_x = (std::uint32_t*)x;
++    *out_w = (std::uint32_t*)w;
++    return true;
++}
++
+ }  // namespace detail
+ #endif
+ 
+@@ -69,6 +124,11 @@ public:
+         m_memory = (std::uint32_t*)VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+ #elif defined(__APPLE__)
+ #    if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
++        if (detail::process_is_debuggable()
++            && detail::map_jit_region(size, &m_memory, &m_wmemory)) {
++            // Mapped it ourselves; no debugger has to stay attached and no
++            // trap is executed. m_should_detach_jit_server stays false.
++        } else {
+         auto& reusable_region = detail::reusable_jit_region();
+         if (reusable_region.memory != nullptr) {
+             if (reusable_region.in_use || reusable_region.size != size)
+@@ -108,6 +168,7 @@ public:
+             reusable_region = {m_memory, m_wmemory, size, true};
+             m_should_detach_jit_server = true;
+         }
++        }
+ #    elif TARGET_OS_IPHONE
+         m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+ #    else

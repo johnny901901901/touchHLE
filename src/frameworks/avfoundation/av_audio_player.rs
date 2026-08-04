@@ -111,11 +111,25 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_file_id = Some(audio_file_id);
     env.mem.free(tmp_afi_ptr.cast());
     if status != 0 {
+        // Worth saying out loud: the app gets nil back, and a caller that does
+        // not check for that will dereference it and die somewhere unrelated,
+        // with nothing in the log connecting the crash to this file.
+        log!(
+            "Warning: AVAudioPlayer couldn't open {:?} (AudioFileOpenURL status {}), \
+             returning nil.",
+            path_str,
+            status
+        );
         if !outError.is_null() {
             let domain = ns_string::get_static_str(env, NSOSStatusErrorDomain);
             let error = msg_class![env; NSError alloc];
             let error = msg![env; error initWithDomain:domain code:status userInfo:nil];
             env.mem.write(outError, error);
+        } else {
+            log!(
+                "Warning: the app passed a NULL error pointer, so it has no way to \
+                 find out why loading failed."
+            );
         }
         return nil;
     }
@@ -870,14 +884,25 @@ fn _touchHLE_AVAudioPlayerOutputBufferHelper(
                 .objc
                 .borrow::<AVAudioPlayerHostObject>(av_audio_player)
                 .delegate;
+            // audioPlayerDidFinishPlaying:successfully: is optional on
+            // AVAudioPlayerDelegate, so a delegate that does not implement it is
+            // perfectly valid. Sending it unconditionally aborted the app on
+            // such delegates - Sword of Fargoal's iPad release sets one.
             if delegate != nil {
-                let successfully: bool = true;
-                () = msg![
-                    env;
-                    delegate
-                    audioPlayerDidFinishPlaying:av_audio_player
-                    successfully:successfully
-                ];
+                if let Some(sel) =
+                    env.objc.lookup_selector("audioPlayerDidFinishPlaying:successfully:")
+                {
+                    let responds: bool = msg![env; delegate respondsToSelector:sel];
+                    if responds {
+                        let successfully: bool = true;
+                        () = msg![
+                            env;
+                            delegate
+                            audioPlayerDidFinishPlaying:av_audio_player
+                            successfully:successfully
+                        ];
+                    }
+                }
             }
         } else {
             if number_of_loops > 0 {

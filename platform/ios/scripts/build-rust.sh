@@ -42,9 +42,13 @@ CMAKE_TOOLCHAIN_FILE="$ROOT/cmake/TouchHLEiOS.cmake"
 CMAKE_GENERATOR=Ninja
 CMAKE="$ROOT/scripts/cmake-ios.sh"
 DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
-IPHONEOS_DEPLOYMENT_TARGET=17.4
-CFLAGS="${CFLAGS:-} -ffile-prefix-map=$HOME=/build -fdebug-prefix-map=$HOME=/build"
-CXXFLAGS="${CXXFLAGS:-} -DFMT_CONSTEVAL= -ffile-prefix-map=$HOME=/build -fdebug-prefix-map=$HOME=/build"
+IPHONEOS_DEPLOYMENT_TARGET=15.0
+# The cc crate still adds -fembed-bitcode for Apple embedded targets, but Apple
+# removed bitcode support and ld now refuses it outright ("-mllvm and
+# -bitcode_bundle cannot be used together"). These env CFLAGS land after the cc
+# crate's own flags, so -fembed-bitcode=off wins.
+CFLAGS="${CFLAGS:-} -fembed-bitcode=off -ffile-prefix-map=$HOME=/build -fdebug-prefix-map=$HOME=/build"
+CXXFLAGS="${CXXFLAGS:-} -fembed-bitcode=off -DFMT_CONSTEVAL= -ffile-prefix-map=$HOME=/build -fdebug-prefix-map=$HOME=/build"
 
 # The core is a dylib that links against the shared SDL2 embedded in the app
 # bundle (see build-sdl-shared.sh), not against a private static copy.
@@ -58,7 +62,27 @@ if [ ! -f "$SDL_LIB_DIR/libSDL2-2.0.0.dylib" ]; then
     echo "Run platform/ios/scripts/build-sdl-shared.sh $SDL_SDK first." >&2
     exit 1
 fi
-SDL_LINK_ARGS="-C link-arg=-L$SDL_LIB_DIR -C link-arg=-Wl,-rpath,@executable_path/Frameworks -C link-arg=-Wl,-rpath,@loader_path"
+# Flags go to cargo through CARGO_ENCODED_RUSTFLAGS, which is delimited by the
+# unit separator rather than spaces. RUSTFLAGS and CARGO_TARGET_*_RUSTFLAGS are
+# space-split, so a checkout under a path containing a space (say
+# "touchHLE v3/") made rustc treat the -L directory as two input filenames and
+# fail before compiling anything.
+UNIT_SEPARATOR=$(printf '\037')
+ENCODED_RUSTFLAGS=
+add_rustflag() {
+    if [ -z "$ENCODED_RUSTFLAGS" ]; then
+        ENCODED_RUSTFLAGS=$1
+    else
+        ENCODED_RUSTFLAGS="$ENCODED_RUSTFLAGS$UNIT_SEPARATOR$1"
+    fi
+}
+
+add_rustflag "-C"
+add_rustflag "link-arg=-L$SDL_LIB_DIR"
+add_rustflag "-C"
+add_rustflag "link-arg=-Wl,-rpath,@executable_path/Frameworks"
+add_rustflag "-C"
+add_rustflag "link-arg=-Wl,-rpath,@loader_path"
 
 # The install name has to be set by the linker, not by install_name_tool
 # afterwards: patching it shifts the LINKEDIT string pool, and if that lands on
@@ -78,9 +102,22 @@ if [ -z "$CORE_LIB_NAME" ]; then
     exit 1
 fi
 CORE_DYLIB="lib$CORE_LIB_NAME.dylib"
-INSTALL_NAME_ARGS="-C link-arg=-Wl,-install_name,@rpath/$CORE_DYLIB"
+add_rustflag "-C"
+add_rustflag "link-arg=-Wl,-install_name,@rpath/$CORE_DYLIB"
+add_rustflag "--remap-path-prefix=$HOME=/build"
 
-IOS_LINK_ARGS="$SDL_LINK_ARGS $INSTALL_NAME_ARGS --remap-path-prefix=$HOME=/build -C link-arg=-framework -C link-arg=AVFoundation -C link-arg=-framework -C link-arg=AudioToolbox -C link-arg=-framework -C link-arg=CoreBluetooth -C link-arg=-framework -C link-arg=CoreGraphics -C link-arg=-framework -C link-arg=CoreHaptics -C link-arg=-framework -C link-arg=CoreMotion -C link-arg=-framework -C link-arg=Foundation -C link-arg=-framework -C link-arg=GameController -C link-arg=-framework -C link-arg=Metal -C link-arg=-framework -C link-arg=OpenGLES -C link-arg=-framework -C link-arg=QuartzCore -C link-arg=-framework -C link-arg=UIKit"
+for framework in AVFoundation AudioToolbox CoreBluetooth CoreGraphics \
+                 CoreHaptics CoreMotion Foundation GameController Metal \
+                 OpenGLES QuartzCore UIKit; do
+    add_rustflag "-C"
+    add_rustflag "link-arg=-framework"
+    add_rustflag "-C"
+    add_rustflag "link-arg=$framework"
+done
+
+# The vendored submodules need local patches (see the script for why they are
+# patch files rather than commits).
+sh "$ROOT/scripts/apply-patches.sh"
 
 for command in cargo cmake ninja xcrun; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -98,15 +135,15 @@ fi
 case "$TARGET" in
     aarch64-apple-ios-sim)
         SDKROOT=$(xcrun --sdk iphonesimulator --show-sdk-path)
-        CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS="$IOS_LINK_ARGS"
-        export SDKROOT CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS
         ;;
     aarch64-apple-ios)
         SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
-        CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="$IOS_LINK_ARGS"
-        export SDKROOT CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS
         ;;
 esac
+# Only one target is built per invocation, so a global setting is equivalent to
+# the per-target variables it replaces.
+CARGO_ENCODED_RUSTFLAGS="$ENCODED_RUSTFLAGS"
+export SDKROOT CARGO_ENCODED_RUSTFLAGS
 
 export CARGO_TARGET_DIR TOUCHHLE_BOOST_ROOT
 export CMAKE_TOOLCHAIN_FILE CMAKE_GENERATOR CMAKE DEVELOPER_DIR IPHONEOS_DEPLOYMENT_TARGET

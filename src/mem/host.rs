@@ -81,7 +81,60 @@ pub(super) unsafe fn allocate_guest_memory(
 pub(super) unsafe fn allocate_guest_memory(
     size: usize,
 ) -> std::io::Result<*mut core::ffi::c_void> {
-    unsafe { allocate_memory(size) }
+    use libc::{
+        mmap, mprotect, MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE,
+    };
+
+    // The guest address space is a flat 4GiB mapping. Desktop kernels
+    // overcommit, so asking for it read-write up front costs nothing until the
+    // pages are touched. iOS is stricter about how much address space a process
+    // may map, and on devices that have not been granted
+    // com.apple.developer.kernel.extended-virtual-addressing this fails
+    // outright with ENOMEM - before the guest app has run a single
+    // instruction. Fall back to progressively weaker requests, ending with a
+    // pure PROT_NONE reservation that commits nothing, then widened with
+    // mprotect.
+    let attempt = |prot: i32, flags: i32| -> Result<*mut core::ffi::c_void, std::io::Error> {
+        let ptr = unsafe { mmap(std::ptr::null_mut(), size, prot, flags, -1, 0) };
+        if ptr == libc::MAP_FAILED {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(ptr)
+        }
+    };
+
+    let first_error = match unsafe { allocate_memory(size) } {
+        Ok(ptr) => return Ok(ptr),
+        Err(error) => error,
+    };
+
+    log!(
+        "Could not map {} MiB of guest address space read-write ({}); retrying.",
+        size / (1024 * 1024),
+        first_error
+    );
+
+    if let Ok(ptr) = attempt(
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+    ) {
+        log!("Mapped guest address space with MAP_NORESERVE.");
+        return Ok(ptr);
+    }
+
+    let ptr = attempt(PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE)
+        .or_else(|_| attempt(PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS))
+        // Report the original read-write failure: it is the informative one.
+        .map_err(|_| first_error)?;
+
+    if unsafe { mprotect(ptr, size, PROT_READ | PROT_WRITE) } != 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::munmap(ptr, size) };
+        return Err(error);
+    }
+
+    log!("Mapped guest address space as a reservation widened with mprotect.");
+    Ok(ptr)
 }
 
 /// Cross-platform memory free using the host's system calls.

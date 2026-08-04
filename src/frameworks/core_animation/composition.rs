@@ -29,7 +29,13 @@ use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub(super) struct State {
-    texture_framebuffer: Option<(GLuint, GLuint)>,
+    /// Render target for composition: `(texture, framebuffer, width, height)`.
+    ///
+    /// The dimensions are kept so it can be rebuilt when the screen size or
+    /// resolution scale changes; otherwise a rotation would leave a target of
+    /// the wrong size, which on iOS also means reading back a different number
+    /// of pixels than the target holds.
+    texture_framebuffer: Option<(GLuint, GLuint, u32, u32)>,
     recomposite_next: Option<Instant>,
     fps_counter: Option<FpsCounter>,
     misc_gl_objects: Option<MiscGlObjects>,
@@ -157,14 +163,49 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         msg![env; screen bounds]
     };
     let scale_hack: u32 = env.options.scale_hack.get();
-    let fb_width = screen_bounds.size.width as u32 * scale_hack;
-    let fb_height = screen_bounds.size.height as u32 * scale_hack;
     let present_frame_args = (
         env.window().viewport(),
         env.window().rotation_matrix(),
         env.window().virtual_cursor_visible_at(),
     );
+    let (fb_width, fb_height) = {
+        let width = screen_bounds.size.width as u32 * scale_hack;
+        let height = screen_bounds.size.height as u32 * scale_hack;
+        // Compositing at a higher resolution than the display can show is pure
+        // cost with no visible benefit: the frame is stretched into
+        // `present_frame_args.0` at the end regardless, and on iOS every extra
+        // pixel is also copied through system RAM to reach the guest's context
+        // (see `opengles::present_composited_frame`). An iPad app at scale
+        // hack 3 asks for 2304x3072 - 28 MiB a frame - to be shown in a
+        // 2048x1536 window.
+        //
+        // The frame may be rotated on its way to the window, so compare
+        // against the longest side of the target region rather than matching
+        // axes up.
+        let (_, _, viewport_width, viewport_height) = present_frame_args.0;
+        let limit = viewport_width.max(viewport_height).max(1);
+        let longest = width.max(height);
+        if longest > limit {
+            (
+                (width * limit / longest).max(1),
+                (height * limit / longest).max(1),
+            )
+        } else {
+            (width, height)
+        }
+    };
     let host_framebuffer = env.window().host_framebuffer();
+
+    // On iOS the composited frame cannot be presented from this (internal)
+    // context once the guest has a context of its own, because SDL2 gives each
+    // GL context its own view and only one of them is attached to the window.
+    // Hand the frame to the guest's context instead — see
+    // `opengles::present_composited_frame` for the full explanation.
+    let present_via_guest_ctx = cfg!(target_os = "ios")
+        && env
+            .framework_state
+            .opengles
+            .thread_has_current_ctx(env.current_thread);
 
     // TODO: draw status bar if it's not hidden
 
@@ -174,10 +215,81 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
+
+    // On iOS, SDL2 draws into a framebuffer object of its own rather than 0,
+    // and it recreates that object whenever the window leaves and re-enters
+    // fullscreen - which is precisely what rotating the device does. The value
+    // cached at window creation can therefore be stale by now, and compositing
+    // into a stale framebuffer produces a black screen. Ask for the current one
+    // while it is still bound, before the render-to-texture setup below
+    // replaces the binding.
+    //
+    // Ignore the answer when it is *our* render-to-texture framebuffer, still
+    // bound from the previous frame: adopting that would mean "presenting" the
+    // composited frame into the very texture it came from, and never drawing to
+    // the screen at all.
+    let host_framebuffer = if cfg!(target_os = "ios") {
+        let our_framebuffer = env
+            .framework_state
+            .core_animation
+            .composition
+            .texture_framebuffer
+            .map(|(_texture, framebuffer, _width, _height)| framebuffer);
+        let mut current = 0;
+        unsafe {
+            gles.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut current);
+        }
+        let current = current as u32;
+        if current == host_framebuffer || Some(current) == our_framebuffer {
+            host_framebuffer
+        } else {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                log!(
+                    "Note: host framebuffer changed since window creation ({} -> {}); \
+                     compositing into the current one.",
+                    host_framebuffer,
+                    current
+                );
+            });
+            current
+        }
+    } else {
+        host_framebuffer
+    };
+
     // Set up GL objects needed for render-to-texture. We could draw directly
     // to the screen instead, but this way we can reuse the code for scaling and
     // rotating the screen and drawing the virtual cursor.
-    let texture = if let Some((texture, framebuffer)) = env
+    // Discard a render target left over from a different screen size (e.g. from
+    // before a rotation): it would be presented stretched, and the read-back on
+    // iOS would not match the new dimensions.
+    if let Some((texture, framebuffer, width, height)) = env
+        .framework_state
+        .core_animation
+        .composition
+        .texture_framebuffer
+    {
+        if (width, height) != (fb_width, fb_height) {
+            log_dbg!(
+                "Composition render target resized: {}x{} -> {}x{}",
+                width,
+                height,
+                fb_width,
+                fb_height
+            );
+            unsafe {
+                gles.DeleteFramebuffersOES(1, &framebuffer);
+                gles.DeleteTextures(1, &texture);
+            }
+            env.framework_state
+                .core_animation
+                .composition
+                .texture_framebuffer = None;
+        }
+    }
+
+    let texture = if let Some((texture, framebuffer, _width, _height)) = env
         .framework_state
         .core_animation
         .composition
@@ -235,15 +347,37 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 0,
             );
 
-            // ХАК: Убраны вызовы assert_eq!, которые убивали приложение
-            // при ошибках GL (типа GL_OUT_OF_MEMORY = 1285)
-            let _ = gles.GetError(); // Просто сбрасываем флаг текущей ошибки, чтобы он не висел
-            let _ = gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES); // Проверяем, но не крашимся
+            // Upstream asserted here; that killed the app outright on a GL
+            // error, so the asserts were removed. But discarding the results
+            // silently is just as bad: an incomplete framebuffer means
+            // everything composited into it goes nowhere, which looks exactly
+            // like a game with working audio and a black screen. Report it.
+            let error = gles.GetError();
+            let status = gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES);
+            if error != 0 || status != gles11::FRAMEBUFFER_COMPLETE_OES {
+                log!(
+                    "Warning: composition render target is not usable: \
+                     {}x{} texture, glGetError 0x{:X}, framebuffer status 0x{:X} \
+                     (want 0x{:X}). Nothing composited will be visible. \
+                     Try a lower Resolution Scale.",
+                    fb_width,
+                    fb_height,
+                    error,
+                    status,
+                    gles11::FRAMEBUFFER_COMPLETE_OES,
+                );
+            } else {
+                log_dbg!(
+                    "Composition render target ready: {}x{}",
+                    fb_width,
+                    fb_height
+                );
+            }
         }
         env.framework_state
             .core_animation
             .composition
-            .texture_framebuffer = Some((texture, framebuffer));
+            .texture_framebuffer = Some((texture, framebuffer, fb_width, fb_height));
         texture
     };
 
@@ -392,20 +526,78 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         let _ = gles.GetError();
     }
 
+    {
+        // Composition only runs for apps that lack a fullscreen CAEAGLLayer,
+        // so it is easy for it to be broken without anything noticing.
+        // Record that it ran, and how, exactly once.
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        let (viewport, _, _) = present_frame_args;
+        LOGGED.call_once(|| {
+            log!(
+                "Compositing to host framebuffer {} with texture {}, viewport {:?}, \
+                 presenting via {}.",
+                host_framebuffer,
+                texture,
+                viewport,
+                if present_via_guest_ctx {
+                    "the guest's EAGL context"
+                } else {
+                    "the internal context"
+                }
+            );
+        });
+    }
+
+    // Read the composited frame back while the render-to-texture framebuffer is
+    // still bound, so the guest's context can present it below. (The texture
+    // itself is no use there: OpenGL ES textures are only shared between
+    // contexts in the same sharegroup, and these are not.)
+    let composited_pixels: Vec<u8> = if present_via_guest_ctx {
+        let size = (fb_width as usize) * (fb_height as usize) * 4;
+        let mut pixels = vec![0u8; size];
+        unsafe {
+            gles.ReadPixels(
+                0,
+                0,
+                fb_width as _,
+                fb_height as _,
+                gles11::RGBA,
+                gles11::UNSIGNED_BYTE,
+                pixels.as_mut_ptr().cast(),
+            );
+        }
+        pixels
+    } else {
+        Vec::new()
+    };
+
     // Present our rendered frame (bound to TEXTURE_2D). This copies it to the
     // host window framebuffer, so we need to unbind our internal framebuffer.
-    unsafe {
-        gles.BindTexture(gles11::TEXTURE_2D, texture);
-        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, host_framebuffer);
-        present_frame(
-            gles.as_mut(),
-            present_frame_args.0,
-            present_frame_args.1,
-            present_frame_args.2,
+    if !present_via_guest_ctx {
+        unsafe {
+            gles.BindTexture(gles11::TEXTURE_2D, texture);
+            gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, host_framebuffer);
+            present_frame(
+                gles.as_mut(),
+                present_frame_args.0,
+                present_frame_args.1,
+                present_frame_args.2,
+            );
+        }
+        std::mem::drop(gles);
+        window.swap_window();
+    } else {
+        std::mem::drop(gles);
+    }
+
+    if present_via_guest_ctx {
+        crate::frameworks::opengles::present_composited_frame(
+            env,
+            &composited_pixels,
+            fb_width,
+            fb_height,
         );
     }
-    std::mem::drop(gles);
-    window.swap_window();
 
     animation_state.update_started_and_finished_animations(env);
 

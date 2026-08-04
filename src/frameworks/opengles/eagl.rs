@@ -646,13 +646,37 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     std::mem::drop(gles);
 
-    let Some(&drawable) = env
+    let drawable = env
         .objc
         .borrow::<EAGLContextHostObject>(this)
         .renderbuffer_drawable_bindings
         .borrow()
-        .get(&renderbuffer) else {
+        .get(&renderbuffer)
+        .copied();
+
+    let Some(drawable) = drawable else {
+        // Nothing gets presented here. If it happens every frame the screen
+        // stays black while the FPS counter keeps climbing, which is very hard
+        // to tell apart from a bug elsewhere - so say it out loud once rather
+        // than only under log_dbg.
+        {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                log!(
+                    "Warning: renderbuffer {:?} has no drawable bound to it, so nothing \
+                     can be presented and the screen will stay black. \
+                     [this log will only be shown once]",
+                    renderbuffer
+                );
+            });
+        }
         log_dbg!("Can't present a renderbuffer {:?} not bound to a drawable!", renderbuffer);
+        // Still honour the frame limiter. Returning early without it lets the
+        // guest spin as fast as it can, which is why the FPS counter reads
+        // above the display refresh rate when this path is taken.
+        if let Some(sleep_for) = sleep_for {
+            env.sleep(sleep_for);
+        }
         return false;
     };
 
@@ -670,6 +694,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                 "Using the iOS ES2 direct presenter for a non-fullscreen CAEAGLLayer."
             );
         }
+        log_once!("Presenting via the fullscreen-layer fast path.");
         log_dbg!(
             "Layer {:?} is the fullscreen layer, presenting renderbuffer {:?} directly (fast path).",
             drawable,
@@ -677,7 +702,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
         // re-borrow
         unsafe {
-            present_renderbuffer(env, this);
+            present_renderbuffer(env, this, PresentSource::Renderbuffer);
         }
     } else {
         if fullscreen_layer != nil {
@@ -702,6 +727,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         // copied back to system RAM, and then will have to be copied to VRAM
         // again during composition. find_fullscreen_eagl_layer() exists to
         // avoid this.
+        log_once!("Presenting via the composition slow path (no fullscreen layer).");
         log_dbg!(
             "There is no fullscreen layer, presenting renderbuffer {:?} to layer {:?} by copying to RAM (slow path).",
             renderbuffer,
@@ -970,6 +996,7 @@ unsafe fn present_renderbuffer_es2(
     viewport: (u32, u32, u32, u32),
     rotation_matrix: crate::matrix::Matrix<2>,
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
+    source: PresentSource<'_>,
 ) {
     use crate::gles::gles2_raw as gles2;
 
@@ -1018,29 +1045,44 @@ unsafe fn present_renderbuffer_es2(
     }
 
     // Resolve renderbuffer → texture with a cached FBO + `glCopyTexImage2D`,
-    // using the ES 2.0 entry points.
-    let mut renderbuffer: GLint = 0;
-    gles.GetIntegerv(gles2::RENDERBUFFER_BINDING, &mut renderbuffer);
-    let (width, height) = {
-        let mut w: GLint = 0;
-        let mut h: GLint = 0;
-        gles.GetRenderbufferParameteriv(gles2::RENDERBUFFER, gles2::RENDERBUFFER_WIDTH, &mut w);
-        gles.GetRenderbufferParameteriv(gles2::RENDERBUFFER, gles2::RENDERBUFFER_HEIGHT, &mut h);
-        (w, h)
+    // using the ES 2.0 entry points. A composited frame is already in system
+    // RAM, so there is nothing to resolve: it goes straight into the texture
+    // further down.
+    let composited_pixels = match source {
+        PresentSource::Composited { pixels, .. } => Some(pixels),
+        PresentSource::Renderbuffer => None,
     };
+    let (width, height) = match source {
+        PresentSource::Composited { width, height, .. } => (width, height),
+        PresentSource::Renderbuffer => {
+            let mut renderbuffer: GLint = 0;
+            gles.GetIntegerv(gles2::RENDERBUFFER_BINDING, &mut renderbuffer);
+            let mut w: GLint = 0;
+            let mut h: GLint = 0;
+            gles.GetRenderbufferParameteriv(gles2::RENDERBUFFER, gles2::RENDERBUFFER_WIDTH, &mut w);
+            gles.GetRenderbufferParameteriv(
+                gles2::RENDERBUFFER,
+                gles2::RENDERBUFFER_HEIGHT,
+                &mut h,
+            );
 
+            let present_objects = ensure_present_objects(gles);
+            gles.BindFramebuffer(gles2::FRAMEBUFFER, present_objects.framebuffer);
+            gles.FramebufferRenderbuffer(
+                gles2::FRAMEBUFFER,
+                gles2::COLOR_ATTACHMENT0,
+                gles2::RENDERBUFFER,
+                renderbuffer as GLuint,
+            );
+            let source_framebuffer_status = gles.CheckFramebufferStatus(gles2::FRAMEBUFFER);
+            if source_framebuffer_status != gles2::FRAMEBUFFER_COMPLETE {
+                log_once!("Warning: ES2 present source framebuffer is incomplete.");
+            }
+
+            (w, h)
+        }
+    };
     let present_objects = ensure_present_objects(gles);
-    gles.BindFramebuffer(gles2::FRAMEBUFFER, present_objects.framebuffer);
-    gles.FramebufferRenderbuffer(
-        gles2::FRAMEBUFFER,
-        gles2::COLOR_ATTACHMENT0,
-        gles2::RENDERBUFFER,
-        renderbuffer as GLuint,
-    );
-    let source_framebuffer_status = gles.CheckFramebufferStatus(gles2::FRAMEBUFFER);
-    if source_framebuffer_status != gles2::FRAMEBUFFER_COMPLETE {
-        log_once!("Warning: ES2 present source framebuffer is incomplete.");
-    }
 
     gles.ActiveTexture(gles2::TEXTURE0);
     gles.BindTexture(gles2::TEXTURE_2D, present_objects.texture);
@@ -1067,7 +1109,19 @@ unsafe fn present_renderbuffer_es2(
         gles2::STREAM_DRAW,
     );
     gles.Finish();
-    if cfg!(target_os = "ios") {
+    if let Some(pixels) = composited_pixels {
+        gles.TexImage2D(
+            gles2::TEXTURE_2D,
+            0,
+            gles2::RGBA as GLint,
+            width,
+            height,
+            0,
+            gles2::RGBA,
+            gles2::UNSIGNED_BYTE,
+            pixels.as_ptr().cast(),
+        );
+    } else if cfg!(target_os = "ios") {
         let byte_count = (width as usize)
             .checked_mul(height as usize)
             .and_then(|pixels| pixels.checked_mul(4))
@@ -1511,11 +1565,97 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
     result
 }
 
+/// What [present_renderbuffer] should put on screen.
+#[derive(Copy, Clone)]
+enum PresentSource<'a> {
+    /// The renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES` in the guest's
+    /// context: the normal fullscreen-CAEAGLLayer fast path.
+    Renderbuffer,
+    /// An already-composited RGBA8 frame from Core Animation composition, in
+    /// OpenGL row order (bottom-to-top), i.e. the same orientation
+    /// `glCopyTexImage2D` would have produced from a renderbuffer.
+    ///
+    /// See [present_composited_frame] for why composition can't present this
+    /// itself on iOS.
+    Composited {
+        pixels: &'a [u8],
+        width: GLsizei,
+        height: GLsizei,
+    },
+}
+
+/// Present a frame produced by Core Animation composition
+/// (`core_animation::composition`) through the guest app's EAGL context.
+///
+/// Returns whether it could be presented; if not, the caller must fall back to
+/// presenting from the internal context itself.
+///
+/// # Why this exists
+///
+/// On iOS, SDL2 gives *every* GL context its own `SDL_uikitopenglview`, with
+/// its own `CAEAGLLayer` and its own framebuffer object (see
+/// `UIKit_GL_CreateContext`), and only one of those views is attached to the
+/// window at a time: whichever context most recently became current, because
+/// `-[SDL_uikitview setSDLWindow:]` replaces `viewcontroller.view`.
+///
+/// touchHLE has several contexts on one window — an internal one created with
+/// the window (used for the splash screen and for composition) plus one per
+/// guest `EAGLContext`. As soon as the guest creates its own context, the
+/// internal context's view is removed from the view hierarchy, and it can
+/// never be re-attached: `setSDLWindow:` starts with
+/// `if (window == sdlwindow) return;`, and the detached view still holds the
+/// same `sdlwindow`, so the re-attach is skipped.
+///
+/// So everything composition draws goes to a detached layer: a complete,
+/// correctly sized render target, the right viewport, frames flowing — and a
+/// black screen. Games that take the `presentRenderbuffer:` fast path are
+/// unaffected because that path presents through the *guest's* context (and
+/// into its `drawable_framebuffer`), which does own the attached view. This
+/// routes composited frames the exact same way.
+pub(crate) fn present_composited_frame(
+    env: &mut Environment,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> bool {
+    let Some(context) = *env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread)
+    else {
+        // No guest context on this thread, so no guest view has stolen the
+        // display yet and the internal context can present the frame itself.
+        return false;
+    };
+
+    log_once!(
+        "Presenting composited frames through the guest's EAGL context \
+         (the internal context's view is detached on iOS)."
+    );
+
+    unsafe {
+        present_renderbuffer(
+            env,
+            context,
+            PresentSource::Composited {
+                pixels,
+                width: width as _,
+                height: height as _,
+            },
+        );
+    }
+    true
+}
+
 /// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
 /// (which should be provided by the app) to a texture and presents it with
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
 /// doing so. The front and back buffers are then swapped.
-unsafe fn present_renderbuffer(env: &mut Environment, context: id) {
+///
+/// With [PresentSource::Composited], the ready-made frame is uploaded to that
+/// texture instead of being copied from a renderbuffer; everything else about
+/// the present is identical.
+unsafe fn present_renderbuffer(env: &mut Environment, context: id, source: PresentSource<'_>) {
     // Capture this up front because the env borrow is moved into the GL
     // context machinery below.
     let trace_gl_errors = env.options.trace_gl_errors;
@@ -1561,6 +1701,14 @@ unsafe fn present_renderbuffer(env: &mut Environment, context: id) {
     let rotation_override = env.options.present_rotation_override;
     let rotation_matrix = if let Some(degrees) = rotation_override {
         crate::matrix::Matrix::<2>::z_rotation((degrees as f32).to_radians())
+    } else if matches!(source, PresentSource::Composited { .. }) {
+        // A composited frame already contains whatever transform UIKit applied
+        // to the root view (that's what composition walks the layer tree for),
+        // so it needs the plain device rotation and none of the extra
+        // compensation the direct-present paths below apply. This is the same
+        // matrix composition passes to `present_frame` on desktop, where the
+        // composition path is well-tested.
+        env.window.as_mut().unwrap().rotation_matrix()
     } else if std::env::var_os("TOUCHHLE_DISABLE_PRESENT_ROTATION").is_some() {
         log_once!(
             "TOUCHHLE_DISABLE_PRESENT_ROTATION=1: presenting EAGL renderbuffer without texture rotation"
@@ -1673,6 +1821,7 @@ unsafe fn present_renderbuffer(env: &mut Environment, context: id) {
             viewport,
             rotation_matrix,
             virtual_cursor_visible_at,
+            source,
         );
         std::mem::drop(gles_boxed);
         env.window.as_ref().unwrap().swap_window();
@@ -1685,8 +1834,20 @@ unsafe fn present_renderbuffer(env: &mut Environment, context: id) {
     // draw to the default framebuffer via a textured quad, which can be
     // rotated, scaled or letterboxed as appropriate.
 
-    let renderbuffer: GLuint = get_int(gles, gles11::RENDERBUFFER_BINDING_OES) as _;
-    let (width, height) = get_renderbuffer_size(gles);
+    // A composited frame brings its own dimensions and doesn't come from a
+    // renderbuffer at all.
+    let composited_pixels = match source {
+        PresentSource::Composited { pixels, .. } => Some(pixels),
+        PresentSource::Renderbuffer => None,
+    };
+    let (renderbuffer, width, height) = match source {
+        PresentSource::Composited { width, height, .. } => (0, width, height),
+        PresentSource::Renderbuffer => {
+            let renderbuffer: GLuint = get_int(gles, gles11::RENDERBUFFER_BINDING_OES) as _;
+            let (width, height) = get_renderbuffer_size(gles);
+            (renderbuffer, width, height)
+        }
+    };
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1770,7 +1931,9 @@ unsafe fn present_renderbuffer(env: &mut Environment, context: id) {
     // the renderbuffer to it — this matches the pre-fix behaviour and
     // lets weird non-iOS-pattern apps still present *something*.
     let mut src_framebuffer: GLuint = 0;
-    let used_app_fbo = old_framebuffer != 0;
+    // A composited frame needs no copy source, so leave the app's framebuffer
+    // binding alone entirely (it is restored at the end regardless).
+    let used_app_fbo = composited_pixels.is_some() || old_framebuffer != 0;
     if !used_app_fbo {
         gles.GenFramebuffersOES(1, &mut src_framebuffer);
         gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, src_framebuffer);
@@ -1818,16 +1981,30 @@ unsafe fn present_renderbuffer(env: &mut Environment, context: id) {
     // ensuring correctness is fine. (And on lenient drivers glFinish on
     // an already-flushed pipeline is essentially free.)
     gles.Finish();
-    gles.CopyTexImage2D(
-        gles11::TEXTURE_2D,
-        0,
-        gles11::RGB as _,
-        0,
-        0,
-        width,
-        height,
-        0,
-    );
+    if let Some(pixels) = composited_pixels {
+        gles.TexImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            gles11::RGBA as _,
+            width,
+            height,
+            0,
+            gles11::RGBA,
+            gles11::UNSIGNED_BYTE,
+            pixels.as_ptr().cast(),
+        );
+    } else {
+        gles.CopyTexImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            gles11::RGB as _,
+            0,
+            0,
+            width,
+            height,
+            0,
+        );
+    }
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1856,7 +2033,7 @@ unsafe fn present_renderbuffer(env: &mut Environment, context: id) {
     // are often legitimately black, while the centre is where the
     // actual artwork lives, so that's a much better "did anything
     // render?" signal). Gated on --trace-gl-errors.
-    if trace_gl_errors {
+    if trace_gl_errors && composited_pixels.is_none() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static PROBE_COUNT: AtomicUsize = AtomicUsize::new(0);
         let count = PROBE_COUNT.fetch_add(1, Ordering::Relaxed);

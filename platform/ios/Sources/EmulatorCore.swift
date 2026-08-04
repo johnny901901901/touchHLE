@@ -45,6 +45,47 @@ enum CoreKind: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Whether this core can get its executable memory right now.
+    ///
+    /// The cores differ, so this cannot be one global check. HyperHLE asks for
+    /// JIT memory by executing oaknut's `brk #0xf00d` trap, which a debugger has
+    /// to be attached to service - and TrollStore's "Enable JIT" detaches once
+    /// it is done, so a process that is merely marked debuggable is not enough.
+    /// touchHLE maps RWX directly, so for it CS_DEBUGGED (which survives the
+    /// detach) does the job.
+    var isJITSatisfied: Bool {
+        switch self {
+        case .hyperHLE:
+            // oaknut normally gets its executable memory by trapping into a
+            // debugger that implements a handler for `brk #0xf00d`, which only
+            // StikDebug does. platform/ios/patches/oaknut-rwx-jit.patch makes it
+            // prefer a plain RWX mapping when the process carries CS_DEBUGGED,
+            // so TrollStore's JIT is enough as well - the same requirement as
+            // the touchHLE core.
+            return touchhle_ios_debugger_attached()
+                || touchhle_ios_process_is_debuggable()
+        case .touchHLE:
+            return touchhle_ios_debugger_attached()
+                || touchhle_ios_process_is_debuggable()
+        }
+    }
+
+    /// What to tell the user when `isJITSatisfied` is false.
+    var jitRequirementMessage: String {
+        switch self {
+        case .hyperHLE:
+            return """
+                HyperHLE needs JIT. Enable it through TrollStore or StikDebug and \
+                start the game again.
+                """
+        case .touchHLE:
+            return """
+                touchHLE needs JIT. Enable it through TrollStore or StikDebug and \
+                start the game again.
+                """
+        }
+    }
+
     fileprivate var libraryName: String { "lib\(rawValue)_core.dylib" }
 
     fileprivate var libraryURL: URL? {

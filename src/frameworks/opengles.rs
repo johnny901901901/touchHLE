@@ -12,6 +12,8 @@
 mod eagl;
 mod gles_guest;
 
+pub(crate) use eagl::present_composited_frame;
+
 use touchHLE_gl_bindings::gles11::types::{GLenum, GLint, GLsizei, GLuint};
 
 use crate::mem::ConstPtr;
@@ -59,6 +61,12 @@ impl State {
     fn current_ctx_for_thread(&mut self, thread: crate::ThreadId) -> &mut Option<crate::objc::id> {
         self.current_ctxs.entry(thread).or_insert(None);
         self.current_ctxs.get_mut(&thread).unwrap()
+    }
+
+    /// Whether this thread has a current `EAGLContext`, i.e. whether the guest
+    /// has any GL context of its own that could present a frame.
+    pub fn thread_has_current_ctx(&mut self, thread: crate::ThreadId) -> bool {
+        self.current_ctx_for_thread(thread).is_some()
     }
 
     pub fn set_bound_framebuffer(&mut self, thread: crate::ThreadId, framebuffer: GLuint) {

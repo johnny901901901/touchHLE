@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Default TrollStore entitlements. Safe on every TrollStore-capable device.
+
+    Applied by: platform/ios/scripts/package-ipa.sh --trollstore
+
+    These are kept separate from TouchHLEHost.entitlements because the memory
+    entitlements below need provisioning-profile support that a free Apple
+    account does not have. Including them in the Xcode/AltStore build would
+    break signing there, while TrollStore grants them unconditionally.
+-->
+<plist version="1.0">
+<dict>
+	<!--
+	    Lets TrollStore's "Enable JIT" / "Open with JIT" attach a debugger,
+	    which sets CS_DEBUGGED and gives the emulator core executable memory.
+	    Required: TrollStore only offers the JIT option for apps that declare
+	    this.
+	-->
+	<key>get-task-allow</key>
+	<true/>
+
+	<!--
+	    The guest address space is one flat 4GiB mapping (src/mem.rs:
+	    `type Bytes = [u8; 1 << 32]`). Recent devices have enough virtual
+	    address space for that by default, but older ones do not, and the
+	    mapping fails with ENOMEM before the guest app ever starts - even as a
+	    PROT_NONE reservation, because the limit is on address space rather
+	    than on backing. The symptom is a black screen on game launch.
+
+	    This entitlement (iOS 14+) puts the kernel in "jumbo mode" and grants
+	    the full 64-bit address space, which is what makes the 4GiB mapping
+	    succeed on A12 and older hardware. It applies to the whole process, so
+	    it covers every core the app dlopens.
+	-->
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+
+	<!--
+	    Raises the Jetsam footprint limit. The address space above is virtual;
+	    this covers the pages the emulator actually dirties, so a large guest
+	    app does not get killed partway through.
+	-->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>

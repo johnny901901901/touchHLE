@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    TrollStore entitlements with PERMANENT JIT.
+
+    !! Only use this on A11 and older devices (iPhone X / 8 and earlier). !!
+
+    iOS 15 on A12 and newer bans the three entitlements related to running
+    unsigned code - com.apple.private.cs.debugger, dynamic-codesigning and
+    com.apple.private.skip-library-validation. They are gated by PPL, the
+    hardware page protection introduced with A12, so TrollStore can put them in
+    the signature but the kernel will not honour them; an app that carries them
+    CRASHES ON LAUNCH. See TrollStore's troubleshooting notes.
+
+    On A12+ use TouchHLEHost-TrollStore.entitlements instead and enable JIT per
+    launch through TrollStore.
+
+    Applied by: platform/ios/scripts/package-ipa.sh --trollstore-permanent-jit
+-->
+<plist version="1.0">
+<dict>
+	<!-- Lets a debugger (TrollStore / StikDebug) attach and grant JIT. -->
+	<key>get-task-allow</key>
+	<true/>
+
+	<!-- Permanent RWX memory for the emulator core. A11 and older only. -->
+	<key>dynamic-codesigning</key>
+	<true/>
+
+	<!-- See TouchHLEHost-TrollStore.entitlements for why these are needed. -->
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>

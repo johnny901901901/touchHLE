@@ -16,11 +16,25 @@ fn c_string(value: String) -> CString {
 
 fn run_touchhle(args: Vec<String>) -> i32 {
     touchHLE::clear_host_exit_request();
-    match touchHLE::main(args.into_iter()) {
-        Ok(()) => 0,
-        Err(error) => {
+    // The emulator runs on the main thread and this is called from
+    // Objective-C. Letting a panic unwind past here is undefined behaviour at
+    // the FFI boundary, and in practice it wedges the whole app: the screen
+    // stays black, the exit button stops responding, and nothing says why.
+    // Convert it into an error return so the host restores the library and
+    // reports it.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        touchHLE::main(args.into_iter())
+    }));
+
+    match outcome {
+        Ok(Ok(())) => 0,
+        Ok(Err(error)) => {
             eprintln!("touchHLE failed: {error}");
             1
+        }
+        Err(_) => {
+            eprintln!("touchHLE panicked; see the log above for the cause");
+            2
         }
     }
 }
