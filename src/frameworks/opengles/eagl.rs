@@ -646,7 +646,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     std::mem::drop(gles);
 
-    let drawable = env
+    let bound_renderbuffer = renderbuffer;
+    let mut drawable = env
         .objc
         .borrow::<EAGLContextHostObject>(this)
         .renderbuffer_drawable_bindings
@@ -654,21 +655,85 @@ pub const CLASSES: ClassExports = objc_classes! {
         .get(&renderbuffer)
         .copied();
 
-    let Some(drawable) = drawable else {
-        // Nothing gets presented here. If it happens every frame the screen
-        // stays black while the FPS counter keeps climbing, which is very hard
-        // to tell apart from a bug elsewhere - so say it out loud once rather
-        // than only under log_dbg.
-        {
+    // The renderbuffer the app left bound isn't one it ever attached to a
+    // drawable. On real hardware this can't happen: `renderbufferStorage:
+    // fromDrawable:` makes the app's renderbuffer *be* the layer's backing
+    // store, so whatever it presents is by definition presentable. Here the
+    // drawable is emulated, so a stale `GL_RENDERBUFFER_BINDING` - ours, the
+    // app's, or SDL's, which uses the same namespace in this context - turns
+    // every frame into a silent no-op and freezes the screen on whatever was
+    // last presented.
+    //
+    // When the context has exactly one renderbuffer bound to a drawable there
+    // is nothing to guess about: that is the frame the app means to show.
+    // Adopt it, and bind it, so the read-back / copy below takes its contents
+    // and its size rather than the stale binding's.
+    let mut renderbuffer = renderbuffer;
+    if drawable.is_none() {
+        let sole_binding = {
+            let bindings = env
+                .objc
+                .borrow::<EAGLContextHostObject>(this)
+                .renderbuffer_drawable_bindings
+                .clone();
+            let bindings = bindings.borrow();
+            if bindings.len() == 1 {
+                bindings.iter().next().map(|(&rb, &drawable)| (rb, drawable))
+            } else {
+                None
+            }
+        };
+        if let Some((sole_renderbuffer, sole_drawable)) = sole_binding {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
                 log!(
-                    "Warning: renderbuffer {:?} has no drawable bound to it, so nothing \
-                     can be presented and the screen will stay black. \
-                     [this log will only be shown once]",
-                    renderbuffer
+                    "Note: renderbuffer {:?} was bound at presentRenderbuffer: but has no \
+                     drawable; presenting the context's only drawable-bound renderbuffer \
+                     ({:?}) instead. [this log will only be shown once]",
+                    bound_renderbuffer,
+                    sole_renderbuffer
                 );
             });
+            let window = env.window.as_mut().unwrap();
+            if let Some(mut gles) = super::sync_context(
+                &mut env.framework_state.opengles,
+                &mut env.objc,
+                window,
+                env.current_thread,
+            ) {
+                unsafe {
+                    gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, sole_renderbuffer);
+                }
+            }
+            renderbuffer = sole_renderbuffer;
+            drawable = Some(sole_drawable);
+        }
+    }
+
+    let Some(drawable) = drawable else {
+        // Nothing gets presented here. If it happens every frame the screen
+        // stays black while the FPS counter keeps climbing, which is very hard
+        // to tell apart from a bug elsewhere - so say it out loud rather than
+        // only under log_dbg, and keep counting so a one-off is easy to tell
+        // apart from every-frame.
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static DROPPED: AtomicUsize = AtomicUsize::new(0);
+            let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped == 1 || dropped % 300 == 0 {
+                log!(
+                    "Warning: renderbuffer {:?} has no drawable bound to it, so nothing \
+                     can be presented and the screen will stay black ({} frame(s) dropped \
+                     so far; the context has {} drawable-bound renderbuffer(s)).",
+                    renderbuffer,
+                    dropped,
+                    env.objc
+                        .borrow::<EAGLContextHostObject>(this)
+                        .renderbuffer_drawable_bindings
+                        .borrow()
+                        .len(),
+                );
+            }
         }
         log_dbg!("Can't present a renderbuffer {:?} not bound to a drawable!", renderbuffer);
         // Still honour the frame limiter. Returning early without it lets the
