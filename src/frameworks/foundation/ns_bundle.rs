@@ -1023,19 +1023,33 @@ fn path_for_resource_helper(
         let exec_path_str = env.bundle.executable_path().as_str().to_string();
         return ns_string::from_rust_string(env, exec_path_str);
     }
-    path = msg![env; path stringByAppendingPathComponent:name];
-
-    if extension != nil {
-        let ext_str = ns_string::to_rust_string(env, extension);
-        if !ext_str.is_empty() {
-            path = msg![env; path stringByAppendingPathExtension:extension];
-        }
+    // Real iOS looks for the device-specific file first and only falls back to
+    // the plain name, so try the candidates in that order.
+    let base_path = path;
+    let mut names: Vec<String> = Vec::new();
+    if let Some(variant) = device_specific_resource_name(env, &name_str) {
+        names.push(variant);
     }
+    names.push(name_str.into_owned());
 
     let file_manager: id = msg_class![env; NSFileManager defaultManager];
-    let file_exists: bool = msg![env; file_manager fileExistsAtPath:path];
-    if file_exists {
-        return path;
+    for candidate in names {
+        let candidate: id = ns_string::from_rust_string(env, candidate);
+        path = msg![env; base_path stringByAppendingPathComponent:candidate];
+
+        if extension != nil {
+            let ext_str = ns_string::to_rust_string(env, extension);
+            if !ext_str.is_empty() {
+                path = msg![env; path stringByAppendingPathExtension:extension];
+            }
+        }
+
+        let file_exists: bool = msg![env; file_manager fileExistsAtPath:path];
+        if file_exists {
+            return path;
+        }
+        // Otherwise fall through with `path` left pointing at the last
+        // (plain-name) candidate, which the fallbacks below work from.
     }
 
     // Unity iOS players keep their serialized data files in a sibling Data
@@ -1075,6 +1089,41 @@ fn path_for_resource_helper(
         }
     }
     nil
+}
+
+/// The device-specific filename `NSBundle` looks for before the plain one:
+/// `Foo~ipad.nib` on iPad, `Foo~iphone.nib` on iPhone and iPod touch.
+///
+/// Universal apps ship both variants and rely on this resolution happening
+/// inside `NSBundle`. The Sims Medieval for iPad keeps an iPhone
+/// `MainWindow.nib`, whose `EAGLView` is the 320x460 Interface Builder iPhone
+/// canvas, right next to its iPad one; loading the plain name left the game
+/// drawing into the top-left corner of a 768x1024 window with the rest of the
+/// screen blank.
+///
+/// Returns `None` if the name already carries a device suffix, or in headless
+/// mode where there is no device family to ask about.
+fn device_specific_resource_name(env: &Environment, name: &str) -> Option<String> {
+    let suffix = if env.window.as_ref()?.device_family().is_ipad() {
+        "~ipad"
+    } else {
+        "~iphone"
+    };
+
+    // The suffix goes on the stem of the *last* path component, before any
+    // extension the name already carries: `gfx/menu.png` -> `gfx/menu~ipad.png`.
+    // Only a dot in the last component counts as an extension separator, so
+    // directory names containing dots (`gfx/1.5/tiles`) aren't split.
+    let last_component = name.rfind('/').map_or(0, |slash| slash + 1);
+    let stem_end = name[last_component..]
+        .rfind('.')
+        .map_or(name.len(), |dot| last_component + dot);
+    let (stem, extension) = name.split_at(stem_end);
+    if stem.ends_with("~ipad") || stem.ends_with("~iphone") {
+        return None;
+    }
+
+    Some(format!("{stem}{suffix}{extension}"))
 }
 
 /// Helper function which loads a `strings` file from an `dict_url` and parses
