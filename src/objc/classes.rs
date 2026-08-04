@@ -398,9 +398,24 @@ fn substitute_classes(
     let Ok(name) = mem.cstr_at_utf8(name) else {
         return None;
     };
+    // Chillingo's Crystal social SDK builds its UI from theme files (`.ctd`)
+    // that it used to download from Chillingo's servers into `Documents`.
+    // Those servers are long gone, so the theme is never there, and
+    // `CCModalViewController` puts up its launch splash as an empty
+    // full-screen view that never finishes building and never dismisses. It
+    // covers the game and swallows every touch - Sword of Fargoal for iPad
+    // renders and plays its music underneath, completely uncontrollable.
+    // Faking the class makes `alloc` return nil, so no splash is built at all.
+    //
+    // Matched by exact name rather than by a `CC` prefix like the SDKs below:
+    // Cocos2D uses `CC` for its entire API, and faking that would break every
+    // Cocos2D game.
+    const CRYSTAL_SDK_CLASSES: &[&str] = &["CCModalViewController"];
+
     // Substitute classes that seem to be from various third-party advertising
     // or social network SDKs.
-    if !(name.starts_with("AdMob")
+    if !(CRYSTAL_SDK_CLASSES.contains(&name)
+        || name.starts_with("AdMob")
         || name.starts_with("AltAds")
         || name.starts_with("Mobclix")
         || name.starts_with("FB") // Facebook
