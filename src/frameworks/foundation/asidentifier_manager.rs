@@ -194,13 +194,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     // We call it by sending it the __FuncPtr invoke message with the status.
     let status: ATTrackingManagerAuthorizationStatus = ATTrackingManagerAuthorizationStatusDenied;
     // Invoke the block — blocks respond to `invoke` in touchHLE's block model.
-    let sel = env.objc.lookup_selector("invokeWithUnsignedInt:").unwrap();
+    // `register_host_selector`, not `lookup_selector(...).unwrap()`: the
+    // selector exists only if a loaded binary references that string.
+    let sel = env
+        .objc
+        .register_host_selector("invokeWithUnsignedInt:".to_string(), &mut env.mem);
     let responds: bool = msg![env; completion_handler respondsToSelector:sel];
     if responds {
         let _: () = msg![env; completion_handler invokeWithUnsignedInt:status];
     } else {
         // Fallback: try plain invoke with no arguments (some block wrappers).
-        let sel_plain = env.objc.lookup_selector("invoke").unwrap();
+        let sel_plain = env
+            .objc
+            .register_host_selector("invoke".to_string(), &mut env.mem);
         let responds_plain: bool = msg![env; completion_handler respondsToSelector:sel_plain];
         if responds_plain {
             let _: () = msg![env; completion_handler invoke];

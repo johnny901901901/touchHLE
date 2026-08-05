@@ -2471,9 +2471,25 @@ unsafe fn present_renderbuffer(env: &mut Environment, context: id, source: Prese
         );
     }
     let old_matrix_mode: GLenum = get_int(gles, gles11::MATRIX_MODE) as _;
-    for mode in [gles11::MODELVIEW, gles11::PROJECTION, gles11::TEXTURE] {
+    // Save the three matrices *by value* rather than with `glPushMatrix`.
+    //
+    // OpenGL ES 1.1 only guarantees a stack depth of 2 for PROJECTION and
+    // TEXTURE (Apple's PowerVR driver provides exactly 2). If the app already
+    // has its projection stack at that limit when we present, our push fails
+    // with GL_STACK_OVERFLOW — and the matching `glPopMatrix` below then pops
+    // a matrix the *app* pushed, silently corrupting its transforms from that
+    // frame on. That showed up in Sword of Fargoal as geometry jumping around
+    // during events, alongside a `GL_STACK_OVERFLOW` left in the error queue
+    // by the present path.
+    //
+    // `glLoadMatrixf` needs no stack space, so this cannot fail.
+    let saved_matrices = [
+        (gles11::MODELVIEW, get_floats::<16>(gles, gles11::MODELVIEW_MATRIX)),
+        (gles11::PROJECTION, get_floats::<16>(gles, gles11::PROJECTION_MATRIX)),
+        (gles11::TEXTURE, get_floats::<16>(gles, gles11::TEXTURE_MATRIX)),
+    ];
+    for &(mode, _) in &saved_matrices {
         gles.MatrixMode(mode);
-        gles.PushMatrix();
         gles.LoadIdentity();
     }
     {
@@ -2483,7 +2499,7 @@ unsafe fn present_renderbuffer(env: &mut Environment, context: id, source: Prese
             gles,
             trace_gl_errors,
             &SEEN,
-            "after matrix push+identity for all 3 stacks",
+            "after saving matrices + loading identity for all 3 stacks",
         );
     }
     let old_color: [GLfloat; 4] = get_floats(gles, gles11::CURRENT_COLOR);
@@ -2596,15 +2612,15 @@ unsafe fn present_renderbuffer(env: &mut Environment, context: id, source: Prese
             _ => unreachable!(),
         }
     }
-    for mode in [gles11::MODELVIEW, gles11::PROJECTION, gles11::TEXTURE] {
-        gles.MatrixMode(mode);
-        gles.PopMatrix();
+    for (mode, matrix) in &saved_matrices {
+        gles.MatrixMode(*mode);
+        gles.LoadMatrixf(matrix.as_ptr());
     }
     gles.MatrixMode(old_matrix_mode);
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-        present_check(gles, trace_gl_errors, &SEEN, "after matrix pop+restore");
+        present_check(gles, trace_gl_errors, &SEEN, "after matrix restore");
     }
     gles.Color4f(old_color[0], old_color[1], old_color[2], old_color[3]);
     gles.Viewport(

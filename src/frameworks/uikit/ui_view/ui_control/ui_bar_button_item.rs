@@ -551,7 +551,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         Some(sel) => sel,
         None => {
             log!("Warning: UIBarButtonItem has no action set!");
-            env.objc.lookup_selector("undefinedSelector").unwrap()
+            // Nothing registers a selector by this name, so looking it up and
+            // unwrapping panicked every time an item had no action. Register
+            // it instead: the caller gets a valid SEL that no class
+            // implements, which is what `@selector(undefinedSelector)` would
+            // give it on real iOS.
+            env.objc
+                .register_host_selector("undefinedSelector".to_string(), &mut env.mem)
         }
     }
 }

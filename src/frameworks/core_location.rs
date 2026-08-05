@@ -292,9 +292,16 @@ const CLASSES: ClassExports = objc_classes! {
     // Notify the delegate that we failed immediately.
     let delegate = env.objc.borrow::<CLLocationManagerHostObject>(this).delegate;
     if delegate != nil {
-        let sel = env.objc
-            .lookup_selector("locationManager:didFailWithError:")
-            .unwrap();
+        // Use `register_host_selector` rather than
+        // `lookup_selector(...).unwrap()`: the selector only exists if some
+        // loaded binary references that exact string, and an app is free to
+        // set a delegate that implements none of the failure callbacks.
+        // Crystal SDK 1.2 (Sword of Fargoal) does exactly that, and the
+        // unwrap took the emulator down as soon as the game asked for
+        // location updates.
+        let sel = env
+            .objc
+            .register_host_selector("locationManager:didFailWithError:".to_string(), &mut env.mem);
         let responds: bool = msg![env; delegate respondsToSelector:sel];
         if responds {
             let domain = ns_string::get_static_str(env, "kCLErrorDomain");
@@ -350,9 +357,11 @@ const CLASSES: ClassExports = objc_classes! {
     log_dbg!("CLLocationManager requestWhenInUseAuthorization — denied");
     let delegate = env.objc.borrow::<CLLocationManagerHostObject>(this).delegate;
     if delegate != nil {
-        let sel = env.objc
-            .lookup_selector("locationManager:didChangeAuthorizationStatus:")
-            .unwrap();
+        // Same reasoning as `startUpdatingLocation` above.
+        let sel = env.objc.register_host_selector(
+            "locationManager:didChangeAuthorizationStatus:".to_string(),
+            &mut env.mem,
+        );
         let responds: bool = msg![env; delegate respondsToSelector:sel];
         if responds {
             let _: () = msg![env;
