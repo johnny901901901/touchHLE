@@ -1521,7 +1521,11 @@ impl Environment {
                         } else {
                             "(non-string payload)"
                         };
-                        window::show_error_messagebox(env.window.as_deref(), error_string);
+                        let message = match crate::last_panic_location() {
+                            Some(location) => format!("{error_string} (at {location})"),
+                            None => error_string.to_string(),
+                        };
+                        window::show_error_messagebox(env.window.as_deref(), &message);
                     }
                     // Put the host context back before resuming, the env will
                     // clean it up on drop.
@@ -1636,7 +1640,11 @@ impl Environment {
                         } else {
                             "(non-string payload)"
                         };
-                        window::show_error_messagebox(self.window.as_deref(), error_string);
+                        let message = match crate::last_panic_location() {
+                            Some(location) => format!("{error_string} (at {location})"),
+                            None => error_string.to_string(),
+                        };
+                        window::show_error_messagebox(self.window.as_deref(), &message);
                     }
                     echo!("Register state immediately after panic:");
                     self.dump_all_regs();

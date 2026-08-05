@@ -204,10 +204,15 @@ impl CFDictionaryHostObject {
         };
         // remove if present (count will be decremented if necessary)
         self.remove(env, key);
+        // Don't assume the bucket still exists: `remove()` compares keys by
+        // running guest code — a `CFDictionary` key callback, or an ObjC
+        // `hash`/`isEqual:` message — which can re-enter and mutate this very
+        // dictionary (clearing it, for instance). Unwrapping here turned that
+        // into an emulator panic with no indication of which `unwrap()` fired.
         self.superclass
             .map
-            .get_mut(&hash)
-            .unwrap()
+            .entry(hash)
+            .or_default()
             .push((key, value));
     }
     fn remove(&mut self, env: &mut Environment, key: id) -> bool {
@@ -219,8 +224,16 @@ impl CFDictionaryHostObject {
             .iter()
             .position(|&(candidate_key, _)| self.equal_keys(env, candidate_key, key));
         if let Some(pos) = maybe_pos {
-            let (existing_key, existing_value) =
-                self.superclass.map.get_mut(&hash).unwrap().remove(pos);
+            // `equal_keys` above runs guest code, so the bucket may have been
+            // removed or shortened while we were deciding what to remove from
+            // it. Re-check rather than unwrapping and indexing blindly.
+            let Some(collisions) = self.superclass.map.get_mut(&hash) else {
+                return false;
+            };
+            if pos >= collisions.len() {
+                return false;
+            }
+            let (existing_key, existing_value) = collisions.remove(pos);
             self.release_key(env, existing_key);
             self.release_value(env, existing_value);
             self.superclass.count -= 1;

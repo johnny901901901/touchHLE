@@ -153,21 +153,8 @@ pub extern "C" fn SDL_main(
     _argv: *const *const std::ffi::c_char,
 ) -> std::ffi::c_int {
     // Rust's default panic handler prints to stderr, but on Android that just
-    // gets discarded, so we set a custom hook to make debugging easier.
-    std::panic::set_hook(Box::new(|info| {
-        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
-            *s
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            s.as_str()
-        } else {
-            "(non-string payload)"
-        };
-        if let Some(location) = info.location() {
-            echo_no_panic!("Panic at {}: {}", location, payload);
-        } else {
-            echo_no_panic!("Panic: {}", payload);
-        }
-    }));
+    // gets discarded, so we install our own hook to make debugging easier.
+    install_panic_hook();
     // Empty args: brings up app picker.
     match main([String::new()].into_iter()) {
         Ok(_) => echo!("touchHLE finished"),
@@ -194,7 +181,52 @@ Special options:
     --info
         Print basic information about the app bundle without running the app.
 ";
+/// Where the most recent panic happened, e.g. `src/foo.rs:123:45`.
+static LAST_PANIC_LOCATION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The location of the most recent panic, for reporting alongside its payload.
+///
+/// A panic payload on its own ("called `Option::unwrap()` on a `None` value")
+/// says nothing about *which* `unwrap()` fired, and that is all
+/// [std::panic::catch_unwind] gives us. The hook below stashes the location so
+/// error dialogs can name the file and line.
+pub fn last_panic_location() -> Option<String> {
+    LAST_PANIC_LOCATION.lock().ok()?.clone()
+}
+
+/// Log panics with their source location, and remember it for [last_panic_location].
+///
+/// Rust's default hook prints to stderr, which is fine on desktop but is
+/// discarded on iOS and Android, where the log file is the only record. This
+/// used to be installed on Android only, so an iOS panic reached the user as a
+/// bare payload with no file or line and nothing in the log.
+pub fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                *s
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.as_str()
+            } else {
+                "(non-string payload)"
+            };
+            match info.location() {
+                Some(location) => {
+                    let location = location.to_string();
+                    if let Ok(mut last) = LAST_PANIC_LOCATION.lock() {
+                        *last = Some(location.clone());
+                    }
+                    echo_no_panic!("Panic at {}: {}", location, payload);
+                }
+                None => echo_no_panic!("Panic: {}", payload),
+            }
+        }));
+    });
+}
+
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
+    install_panic_hook();
     echo!(
         "touchHLE {}{}{} — https://touchhle.org/",
         branding(),
@@ -514,7 +546,11 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
                 } else {
                     "(non-string payload)"
                 };
-                window::show_error_messagebox(None, error_string);
+                let message = match last_panic_location() {
+                    Some(location) => format!("{error_string} (at {location})"),
+                    None => error_string.to_string(),
+                };
+                window::show_error_messagebox(None, &message);
             }
             std::panic::resume_unwind(e)
         }

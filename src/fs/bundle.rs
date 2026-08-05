@@ -235,6 +235,12 @@ const DEFAULT_ARCHIVE_CACHE_BUDGET_MIB: usize = 64;
 const ARCHIVE_CACHE_BUDGET_ENV: &str = "TOUCHHLE_IPA_CACHE_BUDGET_MIB";
 
 fn archive_cache_budget() -> Option<usize> {
+    // The launcher opens every game's bundle to read its metadata, so this runs
+    // once per game in the library; only say it once.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let mut announce = |message: std::fmt::Arguments| {
+        ONCE.call_once(|| log!("{}", message));
+    };
     let mib = match std::env::var(ARCHIVE_CACHE_BUDGET_ENV) {
         Ok(value) => match value.trim().parse::<usize>() {
             Ok(mib) => mib,
@@ -250,13 +256,13 @@ fn archive_cache_budget() -> Option<usize> {
         Err(_) => DEFAULT_ARCHIVE_CACHE_BUDGET_MIB,
     };
     if mib == 0 {
-        log!(
-            "Decompressed-IPA cache is unlimited ({}=0). Large bundles may exhaust memory.",
-            ARCHIVE_CACHE_BUDGET_ENV
-        );
+        announce(format_args!(
+            "Decompressed-IPA cache is unlimited ({ARCHIVE_CACHE_BUDGET_ENV}=0). \
+             Large bundles may exhaust memory."
+        ));
         None
     } else {
-        log!("Decompressed-IPA cache limit: {} MiB.", mib);
+        announce(format_args!("Decompressed-IPA cache limit: {mib} MiB."));
         Some(mib * 1024 * 1024)
     }
 }
