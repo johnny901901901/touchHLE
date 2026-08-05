@@ -501,6 +501,7 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             continue;
         };
         let mut view: id = msg![env; window hitTest:location_in_window withEvent:event];
+        let hit_view = view;
 
         if view != nil {
             let view_class: crate::objc::Class = msg![env; view class];
@@ -533,6 +534,57 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
                 view,
                 f,
             );
+        }
+
+        // Report where the first handful of touches actually land. When an app
+        // stops responding to touch, the question is always "which view is
+        // swallowing them" — a Crystal/OpenFeint style overlay on top of the
+        // game will show up here as an unexpected class covering the screen.
+        // This used to be `log_dbg!`-only, i.e. absent from release builds.
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            const LIMIT: usize = 12;
+            static LOGGED: AtomicUsize = AtomicUsize::new(0);
+            let count = LOGGED.fetch_add(1, Ordering::Relaxed);
+            if count < LIMIT {
+                let describe = |env: &mut Environment, v: id| -> String {
+                    if v == nil {
+                        return "nil".to_string();
+                    }
+                    let class: crate::objc::Class = msg![env; v class];
+                    let name = env.objc.get_class_name(class).to_owned();
+                    let frame: CGRect = msg![env; v frame];
+                    let bounds: CGRect = msg![env; v bounds];
+                    let hidden: bool = msg![env; v isHidden];
+                    let interaction: bool = msg![env; v isUserInteractionEnabled];
+                    // The window's hitTest skips subviews with alpha < 0.01 and
+                    // tests the point against `bounds`, so both matter here.
+                    let alpha: crate::frameworks::core_graphics::CGFloat =
+                        msg![env; v alpha];
+                    format!(
+                        "{} {:?} frame={:?} bounds={:?} hidden={} userInteraction={} alpha={}",
+                        name, v, frame, bounds, hidden, interaction, alpha
+                    )
+                };
+                let hit_desc = describe(env, hit_view);
+                let target_desc = if view == hit_view {
+                    "(same)".to_string()
+                } else {
+                    describe(env, view)
+                };
+                // CGPoint is `repr(packed)`, so its fields cannot be borrowed
+                // by `format_args!` — copy them out first.
+                let (lx, ly) = (location_in_window.x, location_in_window.y);
+                log!(
+                    "Touch {}/{} at ({}, {}) in window: hitTest gave {} -> delivering to {}",
+                    count + 1,
+                    LIMIT,
+                    lx,
+                    ly,
+                    hit_desc,
+                    target_desc,
+                );
+            }
         }
 
         let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];

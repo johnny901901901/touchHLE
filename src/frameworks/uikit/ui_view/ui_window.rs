@@ -25,7 +25,10 @@ use crate::frameworks::uikit::ui_device::{
     UIDeviceOrientationLandscapeLeft, UIDeviceOrientationLandscapeRight,
     UIDeviceOrientationPortraitUpsideDown,
 };
-use crate::objc::{id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports};
+use crate::objc::{
+    id, msg, msg_class, msg_super, nil, objc_classes, release, retain, Class, ClassExports,
+};
+use crate::Environment;
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -45,6 +48,41 @@ pub struct State {
     /// is retained while the window holds it, mirroring Apple's documented
     /// strong-property semantics.
     pub root_view_controllers: HashMap<id, id>,
+}
+
+/// Whether `view` is an empty, invisible container that merely happens to lie on
+/// top of something the user could actually be aiming at.
+///
+/// SDKs bolt their overlays straight onto the app's window: Crystal 1.2 (Sword
+/// of Fargoal) adds a plain `UIView`, rotates it a quarter turn and sizes it to
+/// the whole window so it can host a 353x59 banner in one corner. UIKit's
+/// hit-testing hands that container every touch that misses the banner, so the
+/// game's `EAGLView` underneath — the whole interface — stops responding.
+///
+/// Deliberately narrow, because intercepting touches *is* normally correct:
+/// - only a plain `UIView`, never a subclass, which might implement `-drawRect:`
+///   and draw content we can't see from here;
+/// - never a view backed by a `CAEAGLLayer`, which is a render surface and
+///   always a legitimate target;
+/// - only when the layer has no background colour, i.e. nothing was ever drawn.
+///
+/// Anything with content, or any custom class, keeps its touch as before.
+fn touchhle_is_invisible_container(env: &mut Environment, view: id) -> bool {
+    let class: Class = msg![env; view class];
+    if env.objc.get_class_name(class) != "UIView" {
+        return false;
+    }
+    let layer = env.objc.borrow::<UIViewHostObject>(view).layer;
+    if layer == nil {
+        return true;
+    }
+    let eagl_layer_class: Class = msg_class![env; CAEAGLLayer class];
+    let is_eagl: bool = msg![env; layer isKindOfClass:eagl_layer_class];
+    if is_eagl {
+        return false;
+    }
+    let background: id = msg![env; layer backgroundColor];
+    background == nil
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -180,6 +218,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 // pass events on to their subviews."
 - (id)hitTest:(CGPoint)point withEvent:(id)event {
     let subviews = env.objc.borrow::<super::UIViewHostObject>(this).subviews.clone();
+    // An empty overlay that claimed the point only because it covers the screen
+    // is kept as a last resort: we prefer anything below it that actually has
+    // something there, and only fall back to the overlay if nothing does.
+    let mut invisible_overlay: id = nil;
     for subview in subviews.into_iter().rev() {
         let hidden: bool = msg![env; subview isHidden];
         let alpha: crate::frameworks::core_graphics::CGFloat = msg![env; subview alpha];
@@ -187,7 +229,29 @@ pub const CLASSES: ClassExports = objc_classes! {
         if hidden || alpha < 0.01 || !interactible { continue; }
         let sub_point: CGPoint = msg![env; subview convertPoint:point fromView:this];
         let hit: id = msg![env; subview hitTest:sub_point withEvent:event];
-        if hit != nil { return hit; }
+        if hit == nil {
+            continue;
+        }
+        // A descendant claimed the point, so the touch was certainly meant for
+        // this branch of the hierarchy.
+        if hit != subview {
+            return hit;
+        }
+        if touchhle_is_invisible_container(env, subview) {
+            if invisible_overlay == nil {
+                log_once!(
+                    "Note: a plain UIView with no content covers the window and is \
+                     claiming touches; looking underneath it first so the app's own \
+                     views still receive input."
+                );
+                invisible_overlay = subview;
+            }
+            continue;
+        }
+        return hit;
+    }
+    if invisible_overlay != nil {
+        return invisible_overlay;
     }
     this
 }
@@ -321,6 +385,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())addSubview:(id)view {
     log_dbg!("[(UIWindow*){:?} addSubview:{:?}] => ()", this, view);
+
+    // Name every view put directly into the window. A game that stops
+    // responding to touch usually has something layered over it (a Crystal /
+    // OpenFeint / ad-SDK overlay), and this is where that arrives.
+    if view != nil {
+        let view_class: Class = msg![env; view class];
+        let view_class_name = env.objc.get_class_name(view_class).to_owned();
+        let view_frame: CGRect = msg![env; view frame];
+        let interaction: bool = msg![env; view isUserInteractionEnabled];
+        log!(
+            "UIWindow addSubview: {} {:?} frame={:?} userInteraction={}",
+            view_class_name,
+            view,
+            view_frame,
+            interaction,
+        );
+    }
 
     // A direct child of the window with *both* dimensions flexible is asking to
     // fill the window - that is what UIViewAutoresizingFlexibleWidth |

@@ -297,6 +297,42 @@ fn ultrahle_minionjump_landscape_rect() -> CGRect {
     }
 }
 
+/// Log a geometry change on a view that sits directly in a `UIWindow`.
+///
+/// An SDK overlay dropped on top of the game is a direct child of the window,
+/// and whether it swallows touches comes down to how big it ends up. Naming who
+/// resizes it — the app, or the autoresizing pass — is otherwise guesswork,
+/// because only the *final* frame is visible at touch-dispatch time.
+fn touchhle_log_window_child_geometry(env: &mut Environment, this: id, what: &str, requested: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const LIMIT: usize = 24;
+    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+
+    let superview = env.objc.borrow::<UIViewHostObject>(this).superview;
+    if superview == nil {
+        return;
+    }
+    let window_class: Class = env.objc.get_known_class("UIWindow", &mut env.mem);
+    let in_window: bool = msg![env; superview isKindOfClass:window_class];
+    if !in_window {
+        return;
+    }
+    if LOGGED.fetch_add(1, Ordering::Relaxed) >= LIMIT {
+        return;
+    }
+    let view_class: Class = msg![env; this class];
+    let class_name = env.objc.get_class_name(view_class).to_owned();
+    let current: CGRect = msg![env; this frame];
+    log!(
+        "Window child {} {:?}: {} {} (frame was {:?})",
+        class_name,
+        this,
+        what,
+        requested,
+        current,
+    );
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -1578,6 +1614,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer bounds]
 }
 - (())setBounds:(CGRect)bounds {
+    touchhle_log_window_child_geometry(env, this, "setBounds:", &format!("{:?}", bounds));
     let mut bounds = touchhle_cocos_sanitize_rect(bounds);
 
     if std::env::var_os("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS").is_some() {
@@ -1626,6 +1663,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer frame]
 }
 - (())setFrame:(CGRect)frame {
+    touchhle_log_window_child_geometry(env, this, "setFrame:", &format!("{:?}", frame));
     // ULTRAHLE_MINIONJUMP_SETFRAME_BEGIN
     let frame = if ultrahle_minionjump_force_landscape_ccglview(env, this) {
         touchhle_cocos_landscape_rect(env)
@@ -1698,6 +1736,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer affineTransform]
 }
 - (())setTransform:(CGAffineTransform)transform {
+    touchhle_log_window_child_geometry(env, this, "setTransform:", &format!("{:?}", transform));
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     msg![env; layer setAffineTransform:transform]
 }
