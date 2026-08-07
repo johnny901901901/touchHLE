@@ -42,7 +42,7 @@ CMAKE_TOOLCHAIN_FILE="$ROOT/cmake/TouchHLEiOS.cmake"
 CMAKE_GENERATOR=Ninja
 CMAKE="$ROOT/scripts/cmake-ios.sh"
 DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
-IPHONEOS_DEPLOYMENT_TARGET=15.0
+IPHONEOS_DEPLOYMENT_TARGET=14.7
 CFLAGS="${CFLAGS:-} -ffile-prefix-map=$HOME=/build -fdebug-prefix-map=$HOME=/build"
 CXXFLAGS="${CXXFLAGS:-} -DFMT_CONSTEVAL= -ffile-prefix-map=$HOME=/build -fdebug-prefix-map=$HOME=/build"
 
